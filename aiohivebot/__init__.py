@@ -241,7 +241,7 @@ class _PubNodeClient:
                 # Wait a few seconds before we check for new blocks again.
                 await asyncio.sleep(3)
 
-    def abandon(self):
+    def abort(self):
         """Try to break out of the main loop as quickly as possible so the app can end"""
         self._abandon = True
 
@@ -358,6 +358,8 @@ class BaseBot:
                 await self.transaction(tid=transaction_ids[index],
                                        transaction=transactions[index],
                                        block=block)
+            if self._abandon:
+                return
             # Process all the operations in the transaction
             for operation in operations:
                 # If the derived class has a "operation" callback, invoke it
@@ -366,10 +368,14 @@ class BaseBot:
                                          tid=transaction_ids[index],
                                          transaction=transactions[index],
                                          block=block)
+                    if self._abandon:
+                        return
                 # If the derived class has an operation type specificcallback, invoke it
                 if ("type" in operation and "value" in operation and
                         hasattr(self, operation["type"])):
                     await getattr(self, operation["type"])(operation["value"])
+                    if self._abandon:
+                        return
 
     def __getattr__(self, attr):
         """The __getattr__ method provides the sub-API's."""
@@ -401,3 +407,9 @@ class BaseBot:
                     if rval.result() is not None:
                         return rval
         return JsonRPCResponseNores()
+
+    def abort(self):
+        """Abort async operations in all running tasks"""
+        self._abandon = True
+        for client in self._clients:
+            client.abort()
