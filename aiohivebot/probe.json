@@ -21,7 +21,10 @@
   },
   "bridge": {
       "method": "get_relationship_between_accounts",
-      "params": ["pibarabot", "croupierbot"]
+      "params": {
+	      "account1": "pibarabot",
+	      "account2": "croupierbot"
+      }
   },
   "condenser_api": {
       "method": "get_block_header",
