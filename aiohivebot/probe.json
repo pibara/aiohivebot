@@ -1,0 +1,76 @@
+{
+  "account_by_key_api": {
+      "method": "get_key_references",
+      "params": {
+           "keys": ["STM6RS4sn4qZEKPgRjciQivHDb8Pjw9551XD2qrFAVw7CS4HagJvM"]
+      }
+  },
+  "account_history_api": {
+      "method": "get_account_history",
+      "params": {
+          "account": "pibarabot",
+	  "start": 0,
+	  "limit": 1
+      }
+  },
+  "block_api": {
+      "method": "get_block_header",
+      "params": {
+        "block_num": 0   
+      }
+  },
+  "bridge": {
+      "method": "get_relationship_between_accounts",
+      "params": ["pibarabot", "croupierbot"]
+  },
+  "condenser_api": {
+      "method": "get_block_header",
+      "params": [0]
+  },
+  "database_api": {
+      "method": "get_active_witnesses",
+      "params": {}
+  },
+  "follow_api": {
+      "method": "get_account_reputations",
+      "params": {
+          "account_lower_bound": "pibarabot",
+	  "limit": 1
+      }
+  },
+  "jsonrpc": {
+      "method": "get_signature",
+      "params": {
+          "method": "block_api.get_block_header"
+      }
+  },
+  "market_history_api": {
+      "method": "get_ticker",
+      "params": {}
+  },
+  "rc_api" : {
+      "method": "get_resource_pool",
+      "params": {}
+  },
+  "reputation_api": {
+      "method": "get_account_reputations",
+      "params": {
+          "account_lower_bound": "pibarabot",
+	  "limit": 1
+      } 
+  },
+  "transaction_status_api" : {
+      "method": "find_transaction",
+      "params": {
+          "transaction_id": "641f4bdb3d5c5c1347af9d45804818d83fa86dd5"
+      }
+  },
+  "wallet_bridge_api" : {
+      "method": "get_active_witnesses",
+      "params" : null  
+  },
+  "witness_api": {
+      "method": "get_reserve_ratio",
+      "params": {}
+  }
+}
