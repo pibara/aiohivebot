@@ -22,10 +22,10 @@ class MyBot(BaseBot):
         """Hive Engine custom json action for market cancel"""
         print("Hive-engine market cancel", body, required_posting_auths + required_auths)
 
-    async def sm_sell_card(self, required_auths, required_posting_auths, body):
+    async def l2_sm_sell_card(self, required_auths, required_posting_auths, body):
         print("sm_sell_card", body,  required_posting_auths + required_auths)
 
-    async def pp_podcast_update(self,required_auths, required_posting_auths, body):
+    async def l2_pp_podcast_update(self,required_auths, required_posting_auths, body):
         if "iris" in body:
             print("pp_podcast_update", body["iris"],  required_posting_auths + required_auths)
 

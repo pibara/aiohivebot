@@ -13,18 +13,13 @@ class MyBot(BaseBot):
                 data = json.load(persistent)
         except FileNotFoundError:
             data = {"block": None}
-
         super().__init__(start_block=data["block"])
-        self.count = 0
 
     async def block_processed(self,blockno):
         print(blockno)
         data = {"block": blockno}
         with open("persistent.json", "w", encoding="utf-8") as persistent:
             json.dump(data, persistent, indent=2)
-        if self.count == 100:
-            self.abort()
-        self.count += 1
 
 pncset = MyBot()
 loop = asyncio.get_event_loop()

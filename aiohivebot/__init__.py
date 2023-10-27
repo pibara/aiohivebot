@@ -259,7 +259,7 @@ class _PubNodeClient:
             # assumptions made at initialization time. So we renitialize each node roughly
             # once an our, to make sure a long running bot won't get confused over time about
             # what node supports what API's
-            if time.time() - self._last_reinit > 360:
+            if time.time() - self._last_reinit > 900:
                 await self._initialize_api()
                 self._last_reinit = time.time()
             # Our heartbeat operation is get_dynamic_global_properties.
@@ -427,7 +427,8 @@ class BaseBot:
                 "json" in operation["value"] and
                 "required_auths" in operation["value"] and
                 "required_posting_auths" in operation["value"]):
-            custom_json_id = operation["value"]["id"].replace("-", "_")
+            custom_json_id = "l2_" + operation["value"]["id"].replace("-", "_")
+            print(custom_json_id)
             if isinstance(operation["value"]["json"], str):
                 try:
                     operation["value"]["json"] = json.loads(operation["value"]["json"])
@@ -439,9 +440,9 @@ class BaseBot:
                         required_posting_auths=operation["value"][
                             "required_posting_auths"],
                         body=operation["value"]["json"])
-            if custom_json_id == "notify":
+            if custom_json_id == "l2_notify":
                 await self._process_notify(operation)
-            if custom_json_id == "ssc_mainnet_hive":
+            if custom_json_id == "l2_ssc_mainnet_hive":
                 await self._process_hive_engine(operation)
 
     async def _process_block(self, blockno, block):

@@ -71,9 +71,5 @@
   "wallet_bridge_api" : {
       "method": "get_active_witnesses",
       "params" : null  
-  },
-  "witness_api": {
-      "method": "get_reserve_ratio",
-      "params": {}
   }
 }
