@@ -428,7 +428,6 @@ class BaseBot:
                 "required_auths" in operation["value"] and
                 "required_posting_auths" in operation["value"]):
             custom_json_id = "l2_" + operation["value"]["id"].replace("-", "_")
-            print(custom_json_id)
             if isinstance(operation["value"]["json"], str):
                 try:
                     operation["value"]["json"] = json.loads(operation["value"]["json"])
