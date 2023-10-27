@@ -79,17 +79,20 @@ class JsonRPCResponseNores(JsonRPCResponse):
 class _PubNodeClient:
     """Client that keeps up with a single public HIVE-API node"""
     # pylint: disable=too-many-instance-attributes
-    def __init__(self, nodeurl, probes, channels):
+    def __init__(self, nodeurl, probes, bot):
         headers = {"user-agent": "aiohivebot-/" + VERSION}
         self._nodeurl = nodeurl
         self._probes = probes
-        self.channels = channels
+        self.bot = bot
         self._client = httpx.AsyncClient(base_url="https://" + nodeurl, headers=headers)
         self._api_list = []
         self._active = False
         self._abandon = False
         self._latency = EWMA(beta=0.8)
         self._error_rate = EWMA(beta=0.8)
+        self._requests = 0
+        self._errors = 0
+        self._blocks = 0
         self._last_reinit = 0
         self._id = 0
 
@@ -140,10 +143,12 @@ class _PubNodeClient:
             # Measure total request latency: start time
             start_time = time.time()
             try:
+                self._requests += 1
                 req = await self._client.post("/", content=jsonrpc_json)
             except httpx.HTTPError:
                 # HTTP errors are one way for the error_rate to increase, uses decaying average
                 self._error_rate.update(1)
+                self._errors += 1
             if req is not None:
                 # HTTP action has completed, update the latency decaying average.
                 self._latency.update(time.time() - start_time)
@@ -154,10 +159,12 @@ class _PubNodeClient:
                         # JSON decode errors on what is expected to be a valid JSONRPC response
                         #  is another way for the error_rate to increase, uses decaying average
                         self._error_rate.update(1)
+                        self._errors += 1
                 else:
                     # Non 200 OK responses are another way for the error_rate to increase, uses
                     #  decaying average
                     self._error_rate.update(1)
+                    self._errors += 1
             if rjson is not None:
                 if "error" in rjson and "jsonrpc" in rjson:
                     # A JSON-RPC error is likely still a valid response, so doesn't
@@ -172,6 +179,7 @@ class _PubNodeClient:
                     return JsonRPCResponseOK(rjson["result"])
                 # JSON but not a valid JSON-RPC response
                 self._error_rate.update(1)
+                self._errors += 1
             if tries < max_retry and not self._abandon:
                 # Back off for a short while before trying again
                 await asyncio.sleep(retry_pause)
@@ -180,6 +188,17 @@ class _PubNodeClient:
     async def _initialize_api(self):
         """(Re)-initialize the API for this node by figuring out what API subsets
         this node supports"""
+        if self._active:
+            interval = time.time() - self._last_reinit
+            error_rate = self._errors / interval
+            ok_rate = (self._requests - self._errors) / interval
+            block_rate = self._blocks / interval
+            self.bot.internal_node_status(node_uri=self._nodeurl,
+                                          error_percentage=100.0 * self._error_rate.get(),
+                                          latency=1000.0 * self._latency.get(),
+                                          ok_rate=60 * ok_rate,
+                                          error_rate=60 * error_rate,
+                                          block_rate=60 * block_rate)
         # Let the BaseBot know that we aren't active right now for a little bit.
         self._active = False
         # Get the list or methods that are explicitly advertised
@@ -195,8 +214,11 @@ class _PubNodeClient:
             if "." in method:
                 namespace, _ = method.split(".")
                 found_endpoints.add(namespace)
+        published_endpoints = found_endpoints.copy()
         # _probes contains API requests probe JSON-RPC request info,
         # Call the probing request for every known sub-API not explicitly advertised
+        all_sub_apis = set(found_endpoints).union(set(self._probes.keys()))
+        all_sub_apis.add("network_broadcast_api")
         for namespace, testmethod in self._probes.items():
             if namespace not in found_endpoints:
                 result = (await self.retried_request(api=namespace,
@@ -205,12 +227,26 @@ class _PubNodeClient:
                                                      max_retry=5)).result()
                 if result is not None:
                     found_endpoints.add(namespace)
+        # We don't have a probe yet for network_broadcast_api, this is a hack
+        if "condenser_api" in found_endpoints:
+            found_endpoints.add("network_broadcast_api")
         self._api_list = sorted(list(found_endpoints))
         # Let the BaseBot know that we are active again
+        api_support_status = {}
+        for subapi in all_sub_apis:
+            api_support_status[subapi] = {}
+            api_support_status[subapi]["published"] = subapi in published_endpoints
+            api_support_status[subapi]["available"] = subapi in found_endpoints
+        self.bot.internal_node_api_support(node_uri=self._nodeurl,
+                                           api_support=api_support_status)
+        self._requests = 0
+        self._errors = 0
+        self._blocks = 0
         self._active = True
 
     async def get_block(self, blockno):
         """Get a specific block from this node's block_api"""
+        self._blocks += 1
         return (await (self.retried_request(api="block_api",
                                             method="get_block",
                                             params={"block_num": blockno}))).result()
@@ -223,7 +259,7 @@ class _PubNodeClient:
             # assumptions made at initialization time. So we renitialize each node roughly
             # once an our, to make sure a long running bot won't get confused over time about
             # what node supports what API's
-            if time.time() - self._last_reinit > 3600:
+            if time.time() - self._last_reinit > 360:
                 await self._initialize_api()
                 self._last_reinit = time.time()
             # Our heartbeat operation is get_dynamic_global_properties.
@@ -236,7 +272,7 @@ class _PubNodeClient:
                     headblock = dynprob["head_block_number"]
                     if not self._abandon:
                         # Tell the BaseBot what the last block available on this node is.
-                        await self.channels(headblock, self)
+                        await self.bot.internal_potential_block(headblock, self)
             if not self._abandon:
                 # Wait a few seconds before we check for new blocks again.
                 await asyncio.sleep(3)
@@ -277,8 +313,8 @@ class BaseBot:
     the public HIVE API nodes, streams the blocks, trnasactions and/or operations
     to the derived class, and allows invocation of JSON-RPC calls from whithin the
     stream event handlers"""
-    def __init__(self):
-        self._block = None
+    def __init__(self, start_block=None):
+        self._block = start_block
         self._clients = []
         # Read in the config that we need for API probing
         probepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.json")
@@ -301,9 +337,24 @@ class BaseBot:
                 "api.hive.blue",
                 "hived.privex.io",
                 "hive.roelandp.nl"]:
-            self._clients.append(_PubNodeClient(public_api_node, probes, self._potential_block))
+            self._clients.append(_PubNodeClient(public_api_node, probes, self))
 
-    async def _potential_block(self, block, nodeclient):
+    # pylint: disable=too-many-arguments
+    def internal_node_status(self, node_uri, error_percentage, latency, ok_rate,
+                             error_rate, block_rate):
+        """This callback forwards hourly node status to the bot implementation if
+        callback is defined"""
+        if hasattr(self, "node_status"):
+            getattr(self, "node_status")(node_uri, error_percentage, latency, ok_rate,
+                                         error_rate, block_rate)
+
+    def internal_node_api_support(self, node_uri, api_support):
+        """This callback forwards hourly node API support to the bot implementation
+        if callback is defined"""
+        if hasattr(self, "node_api_support"):
+            getattr(self, "node_api_support")(node_uri, api_support)
+
+    async def internal_potential_block(self, block, nodeclient):
         """This is the callback used by the node clients to tell the BaseBot about the latest
         known block on a node. If there are new blocks that arent processed yet, the client is
         asked to fetch the blocks"""
@@ -321,7 +372,7 @@ class BaseBot:
                     # Fetch a single block
                     wholeblock = await nodeclient.get_block(blockno)
                     # If no other eventloop beat us to it, process the new block
-                    if blockno - self._block == 1 and "block" in wholeblock:
+                    if blockno - self._block == 1 and wholeblock and "block" in wholeblock:
                         self._block += 1
                         # Process the actual block
                         await self._process_block(blockno, wholeblock["block"].copy())
@@ -338,6 +389,60 @@ class BaseBot:
             tasks.append(loop.create_task(nodeclient.run()))
         # Wait for all tasks to complete
         await asyncio.gather(*tasks)
+
+    async def _process_notify(self, operation):
+        if (isinstance(operation["value"]["json"], list) and
+                len(operation["value"]["json"]) == 2):
+            methodname = "notify_" + str(operation["value"]["json"][0])
+            if hasattr(self, methodname):
+                await getattr(self, methodname)(
+                    required_auths=operation["value"]["required_auths"],
+                    required_posting_auths=operation["value"][
+                        "required_posting_auths"],
+                    body=operation["value"]["json"][1])
+
+    async def _process_hive_engine(self, operation):
+        if isinstance(operation["value"]["json"], dict):
+            actions = [operation["value"]["json"]]
+        elif isinstance(operation["value"]["json"], list):
+            actions = operation["value"]["json"]
+        else:
+            actions = []
+        for action in actions:
+            if ('contractName' in action and
+                    'contractAction' in action and
+                    'contractPayload' in action):
+                methodname = "engine_" + \
+                        action["contractName"] + \
+                        "_" + action["contractAction"]
+                if hasattr(self, methodname):
+                    await getattr(self, methodname)(
+                            required_auths=operation["value"]["required_auths"],
+                            required_posting_auths=operation["value"][
+                                "required_posting_auths"],
+                            body=action["contractPayload"])
+
+    async def _process_custom_json(self, operation):
+        if ("id" in operation["value"] and
+                "json" in operation["value"] and
+                "required_auths" in operation["value"] and
+                "required_posting_auths" in operation["value"]):
+            custom_json_id = operation["value"]["id"].replace("-", "_")
+            if isinstance(operation["value"]["json"], str):
+                try:
+                    operation["value"]["json"] = json.loads(operation["value"]["json"])
+                except json.decoder.JSONDecodeError:
+                    pass
+            if hasattr(self, custom_json_id):
+                await getattr(self, custom_json_id)(
+                        required_auths=operation["value"]["required_auths"],
+                        required_posting_auths=operation["value"][
+                            "required_posting_auths"],
+                        body=operation["value"]["json"])
+            if custom_json_id == "notify":
+                await self._process_notify(operation)
+            if custom_json_id == "ssc_mainnet_hive":
+                await self._process_hive_engine(operation)
 
     async def _process_block(self, blockno, block):
         """Process a brand new block"""
@@ -371,11 +476,15 @@ class BaseBot:
                     if self._abandon:
                         return
                 # If the derived class has an operation type specificcallback, invoke it
-                if ("type" in operation and "value" in operation and
-                        hasattr(self, operation["type"])):
-                    await getattr(self, operation["type"])(operation["value"])
-                    if self._abandon:
-                        return
+                if "type" in operation and "value" in operation:
+                    if hasattr(self, operation["type"]):
+                        await getattr(self, operation["type"])(operation["value"])
+                        if self._abandon:
+                            return
+                    if operation["type"] == "custom_json_operation":
+                        await self._process_custom_json(operation)
+        if hasattr(self, "block_processed"):
+            await getattr(self, "block_processed")(blockno)
 
     def __getattr__(self, attr):
         """The __getattr__ method provides the sub-API's."""
