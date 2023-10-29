@@ -455,7 +455,7 @@ class BaseBot:
         # Wait for all tasks to complete
         await asyncio.gather(*tasks)
 
-    async def _process_notify(self, operation):
+    async def _process_notify(self, operation, tid, transaction, block):
         if (isinstance(operation["value"]["json"], list) and
                 len(operation["value"]["json"]) == 2):
             methodname = "notify_" + str(operation["value"]["json"][0])
@@ -464,9 +464,11 @@ class BaseBot:
                     required_auths=operation["value"]["required_auths"],
                     required_posting_auths=operation["value"][
                         "required_posting_auths"],
-                    body=operation["value"]["json"][1])
+                    body=operation["value"]["json"][1],
+                    tid=tid,
+                    transaction=transaction)
 
-    async def _process_hive_engine(self, operation):
+    async def _process_hive_engine(self, operation, tid, transaction, block):
         if isinstance(operation["value"]["json"], dict):
             actions = [operation["value"]["json"]]
         elif isinstance(operation["value"]["json"], list):
@@ -485,9 +487,11 @@ class BaseBot:
                             required_auths=operation["value"]["required_auths"],
                             required_posting_auths=operation["value"][
                                 "required_posting_auths"],
-                            body=action["contractPayload"])
+                            body=action["contractPayload"],
+                            tid=tid,
+                            transaction=transaction)
 
-    async def _process_custom_json(self, operation):
+    async def _process_custom_json(self, operation, tid, transaction, block):
         if ("id" in operation["value"] and
                 "json" in operation["value"] and
                 "required_auths" in operation["value"] and
@@ -503,11 +507,20 @@ class BaseBot:
                         required_auths=operation["value"]["required_auths"],
                         required_posting_auths=operation["value"][
                             "required_posting_auths"],
-                        body=operation["value"]["json"])
+                        body=operation["value"]["json"],
+                        block=block)
             if custom_json_id == "l2_notify":
-                await self._process_notify(operation)
+                await self._process_notify(
+                        operation=operation,
+                        tid=tid,
+                        transaction=transaction,
+                        block=block)
             if custom_json_id == "l2_ssc_mainnet_hive":
-                await self._process_hive_engine(operation)
+                await self._process_hive_engine(
+                        operation,
+                        tid=tid,
+                        transaction=transaction,
+                        block=block)
 
     async def _process_block(self, blockno, block):
         """Process a brand new block"""
@@ -542,11 +555,20 @@ class BaseBot:
                 # If the derived class has an operation type specificcallback, invoke it
                 if "type" in operation and "value" in operation:
                     if hasattr(self, operation["type"]):
-                        await getattr(self.forwarder, operation["type"])(body=operation["value"])
+                        await getattr(self.forwarder, operation["type"])(
+                                body=operation["value"],
+                                operation=operation,
+                                tid=transaction_ids[index],
+                                transaction=transactions[index],
+                                block=block)
                         if self._abandon:
                             return
                     if operation["type"] == "custom_json_operation":
-                        await self._process_custom_json(operation)
+                        await self._process_custom_json(
+                                operation,
+                                tid=transaction_ids[index],
+                                transaction=transactions[index],
+                                block=block)
         await self.forwarder.block_processed(blockno=blockno)
 
     def __getattr__(self, attr):
