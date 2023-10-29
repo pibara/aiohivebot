@@ -12,12 +12,14 @@ VERSION = "0.1.1"
 
 class FunctionNull:
     """Do nothing functor"""
+    # pylint: disable=too-few-public-methods
     async def __call__(self, *args, **kwargs):
         pass
 
 
 class FunctionForwarder:
     """Forwarder functor that removes all kwargs not part of the  function fingerprint"""
+    # pylint: disable=too-few-public-methods
     def __init__(self, method):
         self.method = method
         self.args = set(inspect.signature(method).parameters.keys())
@@ -26,7 +28,7 @@ class FunctionForwarder:
         # droplist because we dont delete inside of key itteration
         droplist = []
         # Find out what to drop
-        for key in kwargs.keys():
+        for key in kwargs:
             if key not in self.args:
                 droplist.append(key)
         # drop
@@ -41,6 +43,7 @@ class FunctionForwarder:
 
 class ObjectForwarder:
     """Helper class for calling possibly defined user defined methods"""
+    # pylint: disable=too-few-public-methods
     def __init__(self, bot):
         self.bot = bot
 
