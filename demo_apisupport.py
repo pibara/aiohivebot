@@ -9,7 +9,7 @@ class MyBot(BaseBot):
         super().__init__()
         self.count = 0
 
-    def node_api_support(self, node_uri, api_support):
+    async def node_api_support(self, node_uri, api_support):
         print("NODE:", node_uri)
         for key, val in api_support.items():
             if not val["published"]:

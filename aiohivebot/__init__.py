@@ -4,10 +4,50 @@ import asyncio
 import time
 import json
 import os
+import inspect
 import httpx
 from average import EWMA
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
+
+class FunctionNull:
+    """Do nothing functor"""
+    async def __call__(self, *args, **kwargs):
+        pass
+
+
+class FunctionForwarder:
+    """Forwarder functor that removes all kwargs not part of the  function fingerprint"""
+    def __init__(self, method):
+        self.method = method
+        self.args = set(inspect.signature(method).parameters.keys())
+
+    async def __call__(self, *args, **kwargs):
+        # droplist because we dont delete inside of key itteration
+        droplist = []
+        # Find out what to drop
+        for key in kwargs.keys():
+            if key not in self.args:
+                droplist.append(key)
+        # drop
+        for key in droplist:
+            kwargs.pop(key)
+        # Check if all user expected arguments are there
+        unknown = self.args - set(kwargs.keys())
+        if unknown:
+            raise ValueError("Non standard named arguments for method:" + str(list(unknown)))
+        await self.method(**kwargs)
+
+
+class ObjectForwarder:
+    """Helper class for calling possibly defined user defined methods"""
+    def __init__(self, bot):
+        self.bot = bot
+
+    def __getattr__(self, methodname):
+        if hasattr(self.bot, methodname):
+            return FunctionForwarder(getattr(self.bot, methodname))
+        return FunctionNull()
 
 
 class JsonRPCResponse:
@@ -193,12 +233,12 @@ class _PubNodeClient:
             error_rate = self._errors / interval
             ok_rate = (self._requests - self._errors) / interval
             block_rate = self._blocks / interval
-            self.bot.internal_node_status(node_uri=self._nodeurl,
-                                          error_percentage=100.0 * self._error_rate.get(),
-                                          latency=1000.0 * self._latency.get(),
-                                          ok_rate=60 * ok_rate,
-                                          error_rate=60 * error_rate,
-                                          block_rate=60 * block_rate)
+            await self.bot.internal_node_status(node_uri=self._nodeurl,
+                                                error_percentage=100.0 * self._error_rate.get(),
+                                                latency=1000.0 * self._latency.get(),
+                                                ok_rate=60 * ok_rate,
+                                                error_rate=60 * error_rate,
+                                                block_rate=60 * block_rate)
         # Let the BaseBot know that we aren't active right now for a little bit.
         self._active = False
         # Get the list or methods that are explicitly advertised
@@ -237,8 +277,8 @@ class _PubNodeClient:
             api_support_status[subapi] = {}
             api_support_status[subapi]["published"] = subapi in published_endpoints
             api_support_status[subapi]["available"] = subapi in found_endpoints
-        self.bot.internal_node_api_support(node_uri=self._nodeurl,
-                                           api_support=api_support_status)
+        await self.bot.internal_node_api_support(node_uri=self._nodeurl,
+                                                 api_support=api_support_status)
         self._requests = 0
         self._errors = 0
         self._blocks = 0
@@ -313,8 +353,23 @@ class BaseBot:
     the public HIVE API nodes, streams the blocks, trnasactions and/or operations
     to the derived class, and allows invocation of JSON-RPC calls from whithin the
     stream event handlers"""
-    def __init__(self, start_block=None):
+    def __init__(self, start_block=None, roll_back=0, roll_back_units="blocks"):
+        self.forwarder = ObjectForwarder(self)
         self._block = start_block
+        self.roll_back = roll_back
+        self.abort_block = None
+        if roll_back_units == "blocks":
+            self.roll_back *= 1
+        elif roll_back_units == "minutes":
+            self.roll_back *= 20
+        elif roll_back_units == "hours":
+            self.roll_back *= 1200
+        elif roll_back_units == "days":
+            self.roll_back *= 28800
+        elif roll_back_units == "weeks":
+            self.roll_back *= 201600
+        else:
+            raise RuntimeError("Invalid roll_back_units")
         self._clients = []
         # Read in the config that we need for API probing
         probepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.json")
@@ -340,19 +395,22 @@ class BaseBot:
             self._clients.append(_PubNodeClient(public_api_node, probes, self))
 
     # pylint: disable=too-many-arguments
-    def internal_node_status(self, node_uri, error_percentage, latency, ok_rate,
+    async def internal_node_status(self, node_uri, error_percentage, latency, ok_rate,
                              error_rate, block_rate):
         """This callback forwards hourly node status to the bot implementation if
         callback is defined"""
-        if hasattr(self, "node_status"):
-            getattr(self, "node_status")(node_uri, error_percentage, latency, ok_rate,
-                                         error_rate, block_rate)
+        await self.forwarder.node_status(node_uri=node_uri,
+                                         error_percentage=error_percentage,
+                                         latency=latency,
+                                         ok_rate=ok_rate,
+                                         error_rate=error_rate,
+                                         block_rate=block_rate)
 
-    def internal_node_api_support(self, node_uri, api_support):
+    async def internal_node_api_support(self, node_uri, api_support):
         """This callback forwards hourly node API support to the bot implementation
         if callback is defined"""
-        if hasattr(self, "node_api_support"):
-            getattr(self, "node_api_support")(node_uri, api_support)
+        await self.forwarder.node_api_support(node_uri=node_uri,
+                                              api_support=api_support)
 
     async def internal_potential_block(self, block, nodeclient):
         """This is the callback used by the node clients to tell the BaseBot about the latest
@@ -360,7 +418,9 @@ class BaseBot:
         asked to fetch the blocks"""
         # If there is no known last block, consider this one minus one to be the last block
         if self._block is None:
-            self._block = block - 1
+            self._block = block - 1 - self.roll_back
+            if self.roll_back:
+                self.abort_block = block
         # If the providing node is reliable (95% OK) and fast (less than half a second latency)
         # go and see if we can fetch some blocks
         if block > self._block and nodeclient.api_check("block_api", 0.05, 0.5):
@@ -376,6 +436,8 @@ class BaseBot:
                         self._block += 1
                         # Process the actual block
                         await self._process_block(blockno, wholeblock["block"].copy())
+        if self.abort_block:
+            self.abort()
 
     async def run(self, loop, other_tasks=None):
         """Run all of the API node clients as seperate tasks untill all are explicitly abandoned"""
@@ -395,7 +457,7 @@ class BaseBot:
                 len(operation["value"]["json"]) == 2):
             methodname = "notify_" + str(operation["value"]["json"][0])
             if hasattr(self, methodname):
-                await getattr(self, methodname)(
+                await getattr(self.forwarder, methodname)(
                     required_auths=operation["value"]["required_auths"],
                     required_posting_auths=operation["value"][
                         "required_posting_auths"],
@@ -416,7 +478,7 @@ class BaseBot:
                         action["contractName"] + \
                         "_" + action["contractAction"]
                 if hasattr(self, methodname):
-                    await getattr(self, methodname)(
+                    await getattr(self.forwarder, methodname)(
                             required_auths=operation["value"]["required_auths"],
                             required_posting_auths=operation["value"][
                                 "required_posting_auths"],
@@ -434,7 +496,7 @@ class BaseBot:
                 except json.decoder.JSONDecodeError:
                     pass
             if hasattr(self, custom_json_id):
-                await getattr(self, custom_json_id)(
+                await getattr(self.forwarder, custom_json_id)(
                         required_auths=operation["value"]["required_auths"],
                         required_posting_auths=operation["value"][
                             "required_posting_auths"],
@@ -450,17 +512,17 @@ class BaseBot:
         transactions = block.pop("transactions")
         transaction_ids = block.pop("transaction_ids")
         # If the derived class has a "block" callback, invoke it
-        if hasattr(self, "block"):
-            await self.block(block=block,
-                             blockno=blockno)
+        await self.forwarder.block(block=block,
+                                   blockno=blockno,
+                                   transactions=transactions,
+                                   transaction_ids=transaction_ids)
         # Process all the transactions in the block
         # pylint: disable=consider-using-enumerate
         for index in range(0, len(transactions)):
             # Separate operations from the transaction
             operations = transactions[index].pop("operations")
             # If the derived class has a "transaction" callback, invoke it
-            if hasattr(self, "transaction"):
-                await self.transaction(tid=transaction_ids[index],
+            await self.forwarder.transaction(tid=transaction_ids[index],
                                        transaction=transactions[index],
                                        block=block)
             if self._abandon:
@@ -468,23 +530,21 @@ class BaseBot:
             # Process all the operations in the transaction
             for operation in operations:
                 # If the derived class has a "operation" callback, invoke it
-                if hasattr(self, "operation"):
-                    await self.operation(operation=operation,
-                                         tid=transaction_ids[index],
-                                         transaction=transactions[index],
-                                         block=block)
-                    if self._abandon:
-                        return
+                await self.forwarder.operation(operation=operation,
+                                               tid=transaction_ids[index],
+                                               transaction=transactions[index],
+                                               block=block)
+                if self._abandon:
+                    return
                 # If the derived class has an operation type specificcallback, invoke it
                 if "type" in operation and "value" in operation:
                     if hasattr(self, operation["type"]):
-                        await getattr(self, operation["type"])(operation["value"])
+                        await getattr(self.forwarder, operation["type"])(body=operation["value"])
                         if self._abandon:
                             return
                     if operation["type"] == "custom_json_operation":
                         await self._process_custom_json(operation)
-        if hasattr(self, "block_processed"):
-            await getattr(self, "block_processed")(blockno)
+        await self.forwarder.block_processed(blockno=blockno)
 
     def __getattr__(self, attr):
         """The __getattr__ method provides the sub-API's."""

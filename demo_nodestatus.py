@@ -21,7 +21,7 @@ class MyBot(BaseBot):
                 self.abort()
             self.count += 1
 
-    def node_status(self, node_uri, error_percentage, latency, ok_rate, error_rate, block_rate):
+    async def node_status(self, node_uri, error_percentage, latency, ok_rate, error_rate, block_rate):
         print("STATUS:", node_uri, "error percentage =", int(100*error_percentage)/100,
                 "latency= ", int(100*latency)/100,
                 "ok=", int(100*ok_rate)/100, 
