@@ -10,7 +10,7 @@ from dateutil import parser
 import httpx
 from average import EWMA
 
-VERSION = "0.1.3"
+VERSION = "0.1.6"
 
 
 class FunctionNull:
@@ -283,7 +283,7 @@ class _PubNodeClient:
             # assumptions made at initialization time. So we renitialize each node roughly
             # once an our, to make sure a long running bot won't get confused over time about
             # what node supports what API's
-            if time.time() - self._last_reinit > 90:
+            if time.time() - self._last_reinit > 900:
                 await self._initialize_api()
                 self._last_reinit = time.time()
             # Our heartbeat operation is get_dynamic_global_properties.
@@ -486,6 +486,7 @@ class BaseBot:
                 methodname = "engine_" + \
                         action["contractName"] + \
                         "_" + action["contractAction"]
+                print(methodname)
                 if hasattr(self, methodname):
                     await getattr(self.forwarder, methodname)(
                             required_auths=operation["value"]["required_auths"],

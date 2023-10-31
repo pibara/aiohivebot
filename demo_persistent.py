@@ -8,7 +8,6 @@ from aiohivebot import BaseBot
 class MyBot(BaseBot):
     """Example of an aiohivebot python bot without real utility"""
     def __init__(self):
-        data = {"block": 1}
         try: 
             with open("persistent.json", encoding="utf-8") as persistent:
                 data = json.load(persistent)
