@@ -4,11 +4,14 @@ import asyncio
 import time
 import json
 import os
+import datetime
 import inspect
+from dateutil import parser
 import httpx
 from average import EWMA
 
-VERSION = "0.1.1"
+VERSION = "0.1.3"
+
 
 class FunctionNull:
     """Do nothing functor"""
@@ -20,9 +23,13 @@ class FunctionNull:
 class FunctionForwarder:
     """Forwarder functor that removes all kwargs not part of the  function fingerprint"""
     # pylint: disable=too-few-public-methods
-    def __init__(self, method):
+    def __init__(self, method, eat_exceptions, bot):
         self.method = method
         self.args = set(inspect.signature(method).parameters.keys())
+        if eat_exceptions:
+            self._bot = bot
+        else:
+            self._bot = None
 
     async def __call__(self, *args, **kwargs):
         # droplist because we dont delete inside of key itteration
@@ -36,87 +43,51 @@ class FunctionForwarder:
             kwargs.pop(key)
         # Check if all user expected arguments are there
         unknown = self.args - set(kwargs.keys())
-        if unknown:
-            raise ValueError("Non standard named arguments for method:" + str(list(unknown)))
-        await self.method(**kwargs)
+        if self._bot is None:
+            if unknown:
+                raise ValueError("Non standard named arguments for method:" + str(list(unknown)))
+            await self.method(**kwargs)
+        else:
+            try:
+                if unknown:
+                    raise ValueError(
+                            "Non standard named arguments for method:" + str(list(unknown)))
+                await self.method(**kwargs)
+            except Exception as exp:  # pylint: disable=broad-except
+                await self._bot.exception(exception=exp)
 
 
 class ObjectForwarder:
     """Helper class for calling possibly defined user defined methods"""
     # pylint: disable=too-few-public-methods
-    def __init__(self, bot):
-        self.bot = bot
+    def __init__(self, bot, eat_exceptions=False):
+        self._methods = {}
+        self._null = FunctionNull()
+        for method in dir(bot):
+            if (method[0] != "_"
+                    and not method.startswith("internal_")
+                    and method not in ['abort', 'run']):
+                self._methods[method] = FunctionForwarder(
+                        getattr(bot, method),
+                        eat_exceptions,
+                        self)
 
     def __getattr__(self, methodname):
-        if hasattr(self.bot, methodname):
-            return FunctionForwarder(getattr(self.bot, methodname))
-        return FunctionNull()
+        return self._methods.get(methodname, self._null)
 
 
-class JsonRPCResponse:
-    """ Base class for JsonRPC Response classes"""
-    def is_ok(self):
-        """successfull request"""
-        raise NotImplementedError("Don't instantiate base class")
+class JsonRpcError(Exception):
+    """Exception for JSON-RPC errors"""
+    def __init__(self, message, response):
+        super().__init__(message)
+        self.response = response
 
-    def hasres(self):
-        """Has result or error"""
-        raise NotImplementedError("Don't instantiate base class")
-
-    def result(self):
-        """Fetch result if exists"""
-        raise NotImplementedError("Don't instantiate base class")
+    def __str__(self):
+        return str(super()) + " : " + str(self.response)
 
 
-class JsonRPCResponseOK(JsonRPCResponse):
-    """Normal JSON-RPC response"""
-    def __init__(self, data):
-        self.data = data
-
-    def is_ok(self):
-        """successfull request"""
-        return True
-
-    def hasres(self):
-        """Has result or error"""
-        return True
-
-    def result(self):
-        """Fetch result if exists"""
-        return self.data
-
-
-class JsonRPCResponseError(JsonRPCResponse):
-    """JSON-RPC error"""
-    def __init__(self, data):
-        self.data = data.copy()
-
-    def is_ok(self):
-        """successfull request"""
-        return False
-
-    def hasres(self):
-        """Has result or error"""
-        return True
-
-    def result(self):
-        """Fetch result if exists"""
-        return None
-
-
-class JsonRPCResponseNores(JsonRPCResponse):
-    """No results from JSON-RPC"""
-    def is_ok(self):
-        """successfull request"""
-        return False
-
-    def hasres(self):
-        """Has result or error"""
-        return False
-
-    def result(self):
-        """Fetch result if exists"""
-        return None
+class NoResponseError(Exception):
+    """Exception for when none of the nodes gave a valid response"""
 
 
 class _PubNodeClient:
@@ -213,20 +184,20 @@ class _PubNodeClient:
                     # A JSON-RPC error is likely still a valid response, so doesn't
                     # add to error rate
                     self._error_rate.update(0)
-                    return JsonRPCResponseError(rjson["error"])
+                    raise JsonRpcError("JsonRPC error", rjson["error"])
                 if "result" in rjson and "jsonrpc" in rjson:
                     # A regular valid JSONRPC response, decrease the error rate.
                     # Uses decaying average.
                     self._error_rate.update(0)
                     # Return only the result.
-                    return JsonRPCResponseOK(rjson["result"])
+                    return rjson["result"]
                 # JSON but not a valid JSON-RPC response
                 self._error_rate.update(1)
                 self._errors += 1
             if tries < max_retry and not self._abandon:
                 # Back off for a short while before trying again
                 await asyncio.sleep(retry_pause)
-        return JsonRPCResponseNores()
+        raise NoResponseError("No valid JSON-RPC response on query from any node.")
 
     async def _initialize_api(self):
         """(Re)-initialize the API for this node by figuring out what API subsets
@@ -245,10 +216,13 @@ class _PubNodeClient:
         # Let the BaseBot know that we aren't active right now for a little bit.
         self._active = False
         # Get the list or methods that are explicitly advertised
-        methods = (await self.retried_request(api="jsonrpc",
-                                              method="get_methods",
-                                              retry_pause=30,
-                                              max_retry=10)).result()
+        try:
+            methods = await self.retried_request(api="jsonrpc",
+                                                 method="get_methods",
+                                                 retry_pause=30,
+                                                 max_retry=10)
+        except (JsonRpcError, NoResponseError):
+            methods = []
         if methods is None:
             methods = []
         # Extract the sub-API namespaces from the advertised methods list.
@@ -264,10 +238,13 @@ class _PubNodeClient:
         all_sub_apis.add("network_broadcast_api")
         for namespace, testmethod in self._probes.items():
             if namespace not in found_endpoints:
-                result = (await self.retried_request(api=namespace,
-                                                     method=testmethod["method"],
-                                                     params=testmethod["params"],
-                                                     max_retry=5)).result()
+                try:
+                    result = await self.retried_request(api=namespace,
+                                                        method=testmethod["method"],
+                                                        params=testmethod["params"],
+                                                        max_retry=5)
+                except (JsonRpcError, NoResponseError):
+                    result = None
                 if result is not None:
                     found_endpoints.add(namespace)
         # We don't have a probe yet for network_broadcast_api, this is a hack
@@ -290,32 +267,39 @@ class _PubNodeClient:
     async def get_block(self, blockno):
         """Get a specific block from this node's block_api"""
         self._blocks += 1
-        return (await (self.retried_request(api="block_api",
-                                            method="get_block",
-                                            params={"block_num": blockno}))).result()
+        try:
+            return await self.retried_request(api="block_api",
+                                              method="get_block",
+                                              params={"block_num": blockno})
+        except (JsonRpcError, NoResponseError):
+            return None
 
     async def run(self):
         """The main ever lasting loop for this public API node"""
+        client_info = {"uri": self._nodeurl, "latency": None, "error_percentage": None}
         # Only stop when explicitly abandoned.
         while not self._abandon:
             # If a node operator upgrades or reconfigures his/her node, this may break the
             # assumptions made at initialization time. So we renitialize each node roughly
             # once an our, to make sure a long running bot won't get confused over time about
             # what node supports what API's
-            if time.time() - self._last_reinit > 900:
+            if time.time() - self._last_reinit > 90:
                 await self._initialize_api()
                 self._last_reinit = time.time()
             # Our heartbeat operation is get_dynamic_global_properties.
             if "condenser_api" in self._api_list:
-                dynprob = (
-                        await self.retried_request(api="condenser_api",
-                                                   method="get_dynamic_global_properties")
-                             ).result()
-                if dynprob and "head_block_number" in dynprob:
+                try:
+                    dynprob = await self.retried_request(api="condenser_api",
+                                                         method="get_dynamic_global_properties")
+                except (JsonRpcError, NoResponseError):
+                    dynprob = None
+                if dynprob is not None and "head_block_number" in dynprob:
                     headblock = dynprob["head_block_number"]
                     if not self._abandon:
                         # Tell the BaseBot what the last block available on this node is.
-                        await self.bot.internal_potential_block(headblock, self)
+                        client_info["latency"] = self._latency.get() * 1000
+                        client_info["error_percentage"] = self._error_rate.get() * 100
+                        await self.bot.internal_potential_block(headblock, self, client_info)
             if not self._abandon:
                 # Wait a few seconds before we check for new blocks again.
                 await asyncio.sleep(3)
@@ -336,8 +320,8 @@ class _Method:
     async def __call__(self, *args, **kwargs):
         """Forward the call to the api_call method of the BaseBot"""
         if self.api == "condenser_api":
-            return await self.bot.api_call(self.api, self.method, args)
-        return await self.bot.api_call(self.api, self.method, kwargs)
+            return await self.bot.internal_api_call(self.api, self.method, args)
+        return await self.bot.internal_api_call(self.api, self.method, kwargs)
 
 
 class _SubAPI:
@@ -356,8 +340,12 @@ class BaseBot:
     the public HIVE API nodes, streams the blocks, trnasactions and/or operations
     to the derived class, and allows invocation of JSON-RPC calls from whithin the
     stream event handlers"""
-    def __init__(self, start_block=None, roll_back=0, roll_back_units="blocks"):
-        self.forwarder = ObjectForwarder(self)
+    def __init__(self,
+                 start_block=None,
+                 roll_back=0,
+                 roll_back_units="blocks",
+                 eat_exceptions=False):
+        self.forwarder = ObjectForwarder(self, eat_exceptions)
         self._block = start_block
         self.roll_back = roll_back
         self.abort_block = None
@@ -398,8 +386,13 @@ class BaseBot:
             self._clients.append(_PubNodeClient(public_api_node, probes, self))
 
     # pylint: disable=too-many-arguments
-    async def internal_node_status(self, node_uri, error_percentage, latency, ok_rate,
-                             error_rate, block_rate):
+    async def internal_node_status(self,
+                                   node_uri,
+                                   error_percentage,
+                                   latency,
+                                   ok_rate,
+                                   error_rate,
+                                   block_rate):
         """This callback forwards hourly node status to the bot implementation if
         callback is defined"""
         await self.forwarder.node_status(node_uri=node_uri,
@@ -415,7 +408,7 @@ class BaseBot:
         await self.forwarder.node_api_support(node_uri=node_uri,
                                               api_support=api_support)
 
-    async def internal_potential_block(self, block, nodeclient):
+    async def internal_potential_block(self, block, nodeclient, client_info):
         """This is the callback used by the node clients to tell the BaseBot about the latest
         known block on a node. If there are new blocks that arent processed yet, the client is
         asked to fetch the blocks"""
@@ -435,10 +428,12 @@ class BaseBot:
                     # Fetch a single block
                     wholeblock = await nodeclient.get_block(blockno)
                     # If no other eventloop beat us to it, process the new block
-                    if blockno - self._block == 1 and wholeblock and "block" in wholeblock:
+                    if (blockno - self._block == 1
+                            and wholeblock is not None
+                            and "block" in wholeblock):
                         self._block += 1
                         # Process the actual block
-                        await self._process_block(blockno, wholeblock["block"].copy())
+                        await self._process_block(blockno, wholeblock["block"].copy(), client_info)
         if self.abort_block:
             self.abort()
 
@@ -455,7 +450,7 @@ class BaseBot:
         # Wait for all tasks to complete
         await asyncio.gather(*tasks)
 
-    async def _process_notify(self, operation, tid, transaction, block):
+    async def _process_notify(self, operation, tid, transaction, block, client_info, timestamp):
         if (isinstance(operation["value"]["json"], list) and
                 len(operation["value"]["json"]) == 2):
             methodname = "notify_" + str(operation["value"]["json"][0])
@@ -466,9 +461,18 @@ class BaseBot:
                         "required_posting_auths"],
                     body=operation["value"]["json"][1],
                     tid=tid,
-                    transaction=transaction)
+                    transaction=transaction,
+                    block=block,
+                    client_info=client_info,
+                    timestamp=timestamp)
 
-    async def _process_hive_engine(self, operation, tid, transaction, block):
+    async def _process_hive_engine(self,
+                                   operation,
+                                   tid,
+                                   transaction,
+                                   block,
+                                   client_info,
+                                   timestamp):
         if isinstance(operation["value"]["json"], dict):
             actions = [operation["value"]["json"]]
         elif isinstance(operation["value"]["json"], list):
@@ -489,9 +493,18 @@ class BaseBot:
                                 "required_posting_auths"],
                             body=action["contractPayload"],
                             tid=tid,
-                            transaction=transaction)
+                            transaction=transaction,
+                            block=block,
+                            client_info=client_info,
+                            timestamp=timestamp)
 
-    async def _process_custom_json(self, operation, tid, transaction, block):
+    async def _process_custom_json(self,
+                                   operation,
+                                   tid,
+                                   transaction,
+                                   block,
+                                   client_info,
+                                   timestamp):
         if ("id" in operation["value"] and
                 "json" in operation["value"] and
                 "required_auths" in operation["value"] and
@@ -508,30 +521,45 @@ class BaseBot:
                         required_posting_auths=operation["value"][
                             "required_posting_auths"],
                         body=operation["value"]["json"],
-                        block=block)
+                        block=block,
+                        client_info=client_info,
+                        timestamp=timestamp)
             if custom_json_id == "l2_notify":
                 await self._process_notify(
                         operation=operation,
                         tid=tid,
                         transaction=transaction,
-                        block=block)
+                        block=block,
+                        client_info=client_info,
+                        timestamp=timestamp)
             if custom_json_id == "l2_ssc_mainnet_hive":
                 await self._process_hive_engine(
                         operation,
                         tid=tid,
                         transaction=transaction,
-                        block=block)
+                        block=block,
+                        client_info=client_info,
+                        timestamp=timestamp)
 
-    async def _process_block(self, blockno, block):
+    async def _process_block(self, blockno, block, client_info):
         """Process a brand new block"""
         # Separate transactions and transaction ids from the block
         transactions = block.pop("transactions")
         transaction_ids = block.pop("transaction_ids")
+        if "timestamp" in block:
+            try:
+                timestamp = parser.parse(block["timestamp"])
+            except ValueError:
+                timestamp = datetime.datetime.fromtimestamp(0)
+        else:
+            timestamp = datetime.datetime.fromtimestamp(0)
         # If the derived class has a "block" callback, invoke it
         await self.forwarder.block(block=block,
                                    blockno=blockno,
                                    transactions=transactions,
-                                   transaction_ids=transaction_ids)
+                                   transaction_ids=transaction_ids,
+                                   client_info=client_info,
+                                   timestamp=timestamp)
         # Process all the transactions in the block
         # pylint: disable=consider-using-enumerate
         for index in range(0, len(transactions)):
@@ -539,8 +567,10 @@ class BaseBot:
             operations = transactions[index].pop("operations")
             # If the derived class has a "transaction" callback, invoke it
             await self.forwarder.transaction(tid=transaction_ids[index],
-                                       transaction=transactions[index],
-                                       block=block)
+                                             transaction=transactions[index],
+                                             block=block,
+                                             client_info=client_info,
+                                             timestamp=timestamp)
             if self._abandon:
                 return
             # Process all the operations in the transaction
@@ -549,7 +579,9 @@ class BaseBot:
                 await self.forwarder.operation(operation=operation,
                                                tid=transaction_ids[index],
                                                transaction=transactions[index],
-                                               block=block)
+                                               block=block,
+                                               client_info=client_info,
+                                               timestamp=timestamp)
                 if self._abandon:
                     return
                 # If the derived class has an operation type specificcallback, invoke it
@@ -560,7 +592,9 @@ class BaseBot:
                                 operation=operation,
                                 tid=transaction_ids[index],
                                 transaction=transactions[index],
-                                block=block)
+                                block=block,
+                                client_info=client_info,
+                                timestamp=timestamp)
                         if self._abandon:
                             return
                     if operation["type"] == "custom_json_operation":
@@ -568,8 +602,13 @@ class BaseBot:
                                 operation,
                                 tid=transaction_ids[index],
                                 transaction=transactions[index],
-                                block=block)
-        await self.forwarder.block_processed(blockno=blockno)
+                                block=block,
+                                client_info=client_info,
+                                timestamp=timestamp)
+        await self.forwarder.block_processed(
+                blockno=blockno,
+                client_info=client_info,
+                timestamp=timestamp)
 
     def __getattr__(self, attr):
         """The __getattr__ method provides the sub-API's."""
@@ -577,7 +616,7 @@ class BaseBot:
             return _SubAPI(self, attr)
         raise AttributeError(f"Basebot has no sub-API {attr}")
 
-    async def api_call(self, api, method, params):
+    async def internal_api_call(self, api, method, params):
         """This method sets out a JSON-RPC request with the curently most reliable
         and fast node"""
         # Create a sorted list of node suitability metrics and node clients
@@ -586,21 +625,27 @@ class BaseBot:
             unsorted.append(client.get_api_quality(api))
         slist = sorted(unsorted, key=lambda x: (x[0], x[1]))
         # We give it four tries at most
+        last_exception = None
         for _ in range(0, 4):
             # Go through the full list of node clients
             for entry in slist:
                 # Don't use nodes with an error rate of two thirds or more,
                 # don'r use nodes with a latency of more than 30 seconds.
                 if entry[0] < 0.667 and entry[1] < 30:
-                    # Every node client gets two quick tries.
-                    rval = await entry[2].retried_request(api=api,
-                                                          method=method,
-                                                          params=params,
-                                                          max_retry=2,
-                                                          retry_pause=0.2)
-                    if rval.result() is not None:
-                        return rval
-        return JsonRPCResponseNores()
+                    try:
+                        # Every node client gets two quick tries.
+                        return await entry[2].retried_request(api=api,
+                                                              method=method,
+                                                              params=params,
+                                                              max_retry=2,
+                                                              retry_pause=0.2)
+                    except JsonRpcError as exp:
+                        last_exception = exp
+                    except NoResponseError:
+                        pass
+        if last_exception is not None:
+            raise last_exception
+        raise NoResponseError("No valid response from any node""")
 
     def abort(self):
         """Abort async operations in all running tasks"""

@@ -2,6 +2,7 @@
 """Simple demo script that looks for votes on already paid out posts"""
 import asyncio
 import json
+import datetime
 from aiohivebot import BaseBot
 
 class MyBot(BaseBot):
@@ -15,8 +16,8 @@ class MyBot(BaseBot):
             data = {"block": None}
         super().__init__(start_block=data["block"])
 
-    async def block_processed(self,blockno):
-        print(blockno)
+    async def block_processed(self,blockno, timestamp):
+        print(blockno, datetime.datetime.utcnow() - timestamp )
         data = {"block": blockno}
         with open("persistent.json", "w", encoding="utf-8") as persistent:
             json.dump(data, persistent, indent=2)
