@@ -10,7 +10,7 @@ from dateutil import parser
 import httpx
 from average import EWMA
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 
 class FunctionNull:
@@ -486,7 +486,6 @@ class BaseBot:
                 methodname = "engine_" + \
                         action["contractName"] + \
                         "_" + action["contractAction"]
-                print(methodname)
                 if hasattr(self, methodname):
                     await getattr(self.forwarder, methodname)(
                             required_auths=operation["value"]["required_auths"],
