@@ -1,0 +1,35 @@
+{
+  "market": [
+    "buyBook",
+    "sellBook",
+    "tradesHistory",
+    "metrics"
+  ],
+  "tokens": [
+    "balances",
+    "delegations",
+    "pendingUnstakes",
+    "pendingUndelegations",
+    "contractsBalances",
+    ["params", {
+      "one": false
+    }]
+  ],
+  "nft": {
+    ["params", {
+      "one": true
+    }],
+    ["nfts", {
+      "one": true,
+      "args": ["symbol"]
+    }],
+    ["pendingUndelegations", {
+      "one": true,
+      "args": ["symbol"]
+    }]
+    ["CELLinstances", {
+      "one": false,
+      "args": ["ownedBy", "symbol"]
+    }]
+  }
+}
