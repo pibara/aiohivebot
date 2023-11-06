@@ -8,6 +8,6 @@
   "he.ausbit.dev",
   "ctpmain.com",
   "engine.rishipanthee.com",
-  ["api.hive-engine.com", "/rpc"],
-  ["api2.hive-engine.com", "/rpc"]
+  ["api.hive-engine.com", "rpc"],
+  ["api2.hive-engine.com", "rpc"]
 ]

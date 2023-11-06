@@ -19,5 +19,5 @@ class MyBot(BaseBot):
 
 pncset = MyBot()
 loop = asyncio.get_event_loop()
-loop.run_until_complete(pncset.run(loop))
+loop.run_until_complete(pncset.run())
 print("Done")

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='aiohivebot',
-    version='0.1.7',
+    version='0.1.9',
     description="Asynchonous Python client library for the HIVE blockchain",
     long_description="An async python library for writing bots and DApp backends for the HIVE blockchain",
     author='Rob Meijer',

@@ -4,13 +4,14 @@ import asyncio
 import time
 import json
 import os
+import math
 import datetime
 import inspect
 from dateutil import parser
 import httpx
 from average import EWMA
 
-VERSION = "0.1.7"
+VERSION = "0.1.9"
 
 
 class FunctionNull:
@@ -90,11 +91,142 @@ class NoResponseError(Exception):
     """Exception for when none of the nodes gave a valid response"""
 
 
+class _EngineClient:
+    """Client for single Hive-Engine API node"""
+    def __init__(self, public_api_node, bot):
+        headers = {"user-agent": "aiohivebot-/" + VERSION, "Content-Type": "application/json"}
+        self._nodeurl = nodeurl = public_api_node[0]
+        if public_api_node[1]:
+            nodeurl += "/" + public_api_node[1]
+        nodeurl += "/contracts"
+        self.bot = bot
+        self._client = httpx.AsyncClient(base_url="https://" + nodeurl, headers=headers)
+        self._stats = {}
+        self._stats["latency"] = EWMA(beta=0.8)
+        self._stats["error_rate"] = EWMA(beta=0.8)
+        self._stats["requests"] = 0
+        self._stats["errors"] = 0
+        self._stats["blocks"] = 0
+        self._abandon = False
+        self._id = 0
+        self._last_reinit = time.time()
+
+    # pylint: disable=too-many-arguments
+    async def retried_request(self, contract, table, params,
+                              one=False,
+                              retry_pause=0.5,
+                              max_retry=-1):
+        """Try to do a request repeatedly on a potentially flaky API node untill it
+        succeeds or limits are exceeded"""
+        self._id += 1
+        jsonrpc = {
+                "jsonrpc": "2.0",
+                "id": self._id,
+                "method": "find" + "One" if one else "",
+                "params": {
+                        "contract": contract,
+                        "table": table,
+                        "query": params
+                    }
+        }
+        jsonrpc_json = json.dumps(jsonrpc, indent=2)
+        tries = 0
+        # The main retry loop, note we also stop (prematurely) after _abandon is set.
+        while max_retry == -1 and not self._abandon or tries < max_retry and not self._abandon:
+            tries += 1
+            start_time = time.time()
+            rjson = None
+            req = None
+            try:
+                self._stats["requests"] += 1
+                req = await self._client.post("/", content=jsonrpc_json)
+            except httpx.HTTPError:
+                self._stats["error_rate"].update(1)
+                self._stats["errors"] += 1
+            if req is not None:
+                # HTTP action has completed, update the latency decaying average.
+                self._stats["latency"].update(time.time() - start_time)
+                if req.status_code == 200:
+                    try:
+                        rjson = req.json()
+                    except json.decoder.JSONDecodeError:
+                        # JSON decode errors on what is expected to be a valid JSONRPC response
+                        #  is another way for the error_rate to increase, uses decaying average
+                        self._stats["error_rate"].update(1)
+                        self._stats["errors"] += 1
+                else:
+                    # Non 200 OK responses are another way for the error_rate to increase, uses
+                    #  decaying average
+                    self._stats["error_rate"].update(1)
+                    self._stats["errors"] += 1
+            if rjson is not None:
+                if "error" in rjson and "jsonrpc" in rjson:
+                    # A JSON-RPC error is likely still a valid response, so doesn't
+                    # add to error rate
+                    self._stats["error_rate"].update(0)
+                    raise JsonRpcError("JsonRPC error", rjson["error"])
+                if "result" in rjson and "jsonrpc" in rjson:
+                    # A regular valid JSONRPC response, decrease the error rate.
+                    # Uses decaying average.
+                    self._stats["error_rate"].update(0)
+                    # Return only the result.
+                    return rjson["result"]
+                # JSON but not a valid JSON-RPC response
+                self._stats["error_rate"].update(1)
+                self._stats["errors"] += 1
+            if tries < max_retry:
+                pause = retry_pause
+                while not self._abandon and pause >= 1:
+                    pause -= 1.0
+                    await asyncio.sleep(pause)
+                if pause > 0 and not self._abandon:
+                    await asyncio.sleep(pause)
+        raise NoResponseError("No valid JSON-RPC response on query from any node.")
+
+    async def run(self):
+        """Forever running loop for communicating with an hive-engine API node"""
+        while not self._abandon:
+            if time.time() - self._last_reinit > 900:
+                interval = time.time() - self._last_reinit
+                self._last_reinit = time.time()
+                error_rate = self._stats["errors"] / interval
+                ok_rate = (self._stats["requests"] - self._stats["errors"]) / interval
+                block_rate = self._stats["blocks"] / interval
+                error_rate = self._stats["error_rate"].get()
+                if math.isnan(error_rate):
+                    error_rate = 1
+                latency = self._stats["latency"].get()
+                if math.isnan(latency):
+                    latency = 1000000
+                await self.bot.internal_node_status(node_uri=self._nodeurl,
+                                                    error_percentage=100.0 * error_rate,
+                                                    latency=1000.0 * latency,
+                                                    ok_rate=60 * ok_rate,
+                                                    error_rate=60 * error_rate,
+                                                    block_rate=60 * block_rate)
+            try:
+                await self.retried_request(contract="tokens",
+                                           table="balances",
+                                           params={"symbol": "COINZDENSE", "account": "pibara"},
+                                           one=True,
+                                           max_retry=3)
+            except (JsonRpcError, NoResponseError):
+                pass
+            times = 150
+            while not self._abandon and times > 0:
+                times -= 1
+                await asyncio.sleep(1)
+
+    def abort(self):
+        """Try to break out of the main loop as quickly as possible so the app can end"""
+        self._abandon = True
+
+
 class _PubNodeClient:
     """Client that keeps up with a single public HIVE-API node"""
     # pylint: disable=too-many-instance-attributes
     def __init__(self, nodeurl, probes, bot):
-        headers = {"user-agent": "aiohivebot-/" + VERSION}
+        headers = {"user-agent": "aiohivebot-/" + VERSION, "Content-Type": "application/json"}
         self._nodeurl = nodeurl
         self._probes = probes
         self.bot = bot
@@ -102,11 +234,12 @@ class _PubNodeClient:
         self._api_list = []
         self._active = False
         self._abandon = False
-        self._latency = EWMA(beta=0.8)
-        self._error_rate = EWMA(beta=0.8)
-        self._requests = 0
-        self._errors = 0
-        self._blocks = 0
+        self._stats = {}
+        self._stats["latency"] = EWMA(beta=0.8)
+        self._stats["error_rate"] = EWMA(beta=0.8)
+        self._stats["requests"] = 0
+        self._stats["errors"] = 0
+        self._stats["blocks"] = 0
         self._last_reinit = 0
         self._id = 0
 
@@ -122,13 +255,19 @@ class _PubNodeClient:
             return [1, 1000000, self]
         # Otherwise return the current error rate and latency for the node, also return
         # self for easy sorting
-        return [self._error_rate.get(), self._latency.get(), self]
+        error_rate = self._stats["error_rate"].get()
+        if math.isnan(error_rate):
+            error_rate = 1
+        latency = self._stats["latency"].get()
+        if math.isnan(latency):
+            latency = 1000000
+        return [error_rate, latency, self]
 
     def api_check(self, api, error_rate_treshold, max_latency):
         """Check if the node has the given API and if its error rate and latency are within
         reasonable tresholds"""
-        if (api in self._api_list and error_rate_treshold > self._error_rate.get()
-                and max_latency > self._latency.get()):
+        if (api in self._api_list and error_rate_treshold > self._stats["error_rate"].get()
+                and max_latency > self._stats["latency"].get()):
             return True
         return False
 
@@ -157,43 +296,43 @@ class _PubNodeClient:
             # Measure total request latency: start time
             start_time = time.time()
             try:
-                self._requests += 1
+                self._stats["requests"] += 1
                 req = await self._client.post("/", content=jsonrpc_json)
             except httpx.HTTPError:
                 # HTTP errors are one way for the error_rate to increase, uses decaying average
-                self._error_rate.update(1)
-                self._errors += 1
+                self._stats["error_rate"].update(1)
+                self._stats["errors"] += 1
             if req is not None:
                 # HTTP action has completed, update the latency decaying average.
-                self._latency.update(time.time() - start_time)
+                self._stats["latency"].update(time.time() - start_time)
                 if req.status_code == 200:
                     try:
                         rjson = req.json()
                     except json.decoder.JSONDecodeError:
                         # JSON decode errors on what is expected to be a valid JSONRPC response
                         #  is another way for the error_rate to increase, uses decaying average
-                        self._error_rate.update(1)
-                        self._errors += 1
+                        self._stats["error_rate"].update(1)
+                        self._stats["errors"] += 1
                 else:
                     # Non 200 OK responses are another way for the error_rate to increase, uses
                     #  decaying average
-                    self._error_rate.update(1)
-                    self._errors += 1
+                    self._stats["error_rate"].update(1)
+                    self._stats["errors"] += 1
             if rjson is not None:
                 if "error" in rjson and "jsonrpc" in rjson:
                     # A JSON-RPC error is likely still a valid response, so doesn't
                     # add to error rate
-                    self._error_rate.update(0)
+                    self._stats["error_rate"].update(0)
                     raise JsonRpcError("JsonRPC error", rjson["error"])
                 if "result" in rjson and "jsonrpc" in rjson:
                     # A regular valid JSONRPC response, decrease the error rate.
                     # Uses decaying average.
-                    self._error_rate.update(0)
+                    self._stats["error_rate"].update(0)
                     # Return only the result.
                     return rjson["result"]
                 # JSON but not a valid JSON-RPC response
-                self._error_rate.update(1)
-                self._errors += 1
+                self._stats["error_rate"].update(1)
+                self._stats["errors"] += 1
             if tries < max_retry and not self._abandon:
                 # Back off for a short while before trying again
                 await asyncio.sleep(retry_pause)
@@ -202,17 +341,22 @@ class _PubNodeClient:
     async def _initialize_api(self):
         """(Re)-initialize the API for this node by figuring out what API subsets
         this node supports"""
+        # pylint: disable=too-many-branches
         if self._active:
             interval = time.time() - self._last_reinit
-            error_rate = self._errors / interval
-            ok_rate = (self._requests - self._errors) / interval
-            block_rate = self._blocks / interval
+            error_percentage = self._stats["error_rate"].get()
+            if math.isnan(error_percentage):
+                error_percentage = 1
+            latency = self._stats["latency"].get()
+            if math.isnan(latency):
+                latency = 1000000
             await self.bot.internal_node_status(node_uri=self._nodeurl,
-                                                error_percentage=100.0 * self._error_rate.get(),
-                                                latency=1000.0 * self._latency.get(),
-                                                ok_rate=60 * ok_rate,
-                                                error_rate=60 * error_rate,
-                                                block_rate=60 * block_rate)
+                                                error_percentage=(100.0 * error_percentage),
+                                                latency=1000.0 * latency,
+                                                ok_rate=60 * (self._stats["requests"] -
+                                                              self._stats["errors"]) / interval,
+                                                error_rate=60 * self._stats["errors"] / interval,
+                                                block_rate=60 * self._stats["blocks"] / interval)
         # Let the BaseBot know that we aren't active right now for a little bit.
         self._active = False
         # Get the list or methods that are explicitly advertised
@@ -259,14 +403,14 @@ class _PubNodeClient:
             api_support_status[subapi]["available"] = subapi in found_endpoints
         await self.bot.internal_node_api_support(node_uri=self._nodeurl,
                                                  api_support=api_support_status)
-        self._requests = 0
-        self._errors = 0
-        self._blocks = 0
+        self._stats["requests"] = 0
+        self._stats["errors"] = 0
+        self._stats["blocks"] = 0
         self._active = True
 
     async def get_block(self, blockno):
         """Get a specific block from this node's block_api"""
-        self._blocks += 1
+        self._stats["blocks"] += 1
         try:
             return await self.retried_request(api="block_api",
                                               method="get_block",
@@ -297,12 +441,20 @@ class _PubNodeClient:
                     headblock = dynprob["head_block_number"]
                     if not self._abandon:
                         # Tell the BaseBot what the last block available on this node is.
-                        client_info["latency"] = self._latency.get() * 1000
-                        client_info["error_percentage"] = self._error_rate.get() * 100
+                        error_rate = self._stats["error_rate"].get()
+                        if math.isnan(error_rate):
+                            error_rate = 1
+                        latency = self._stats["latency"].get()
+                        if math.isnan(latency):
+                            latency = 1000000
+                        client_info["latency"] = latency * 1000
+                        client_info["error_percentage"] = error_rate * 100
                         await self.bot.internal_potential_block(headblock, self, client_info)
-            if not self._abandon:
+            times = 3
+            while not self._abandon and times > 0:
+                times -= 1
                 # Wait a few seconds before we check for new blocks again.
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
 
     def abort(self):
         """Try to break out of the main loop as quickly as possible so the app can end"""
@@ -340,15 +492,18 @@ class BaseBot:
     the public HIVE API nodes, streams the blocks, trnasactions and/or operations
     to the derived class, and allows invocation of JSON-RPC calls from whithin the
     stream event handlers"""
+    # pylint: disable=too-many-arguments, too-many-instance-attributes
     def __init__(self,
                  start_block=None,
                  roll_back=0,
                  roll_back_units="blocks",
-                 eat_exceptions=False):
+                 eat_exceptions=False,
+                 use_hiveengine=False):
         self.forwarder = ObjectForwarder(self, eat_exceptions)
         self._block = start_block
         self.roll_back = roll_back
         self.abort_block = None
+        self._alltasks = []
         if roll_back_units == "blocks":
             self.roll_back *= 1
         elif roll_back_units == "minutes":
@@ -362,28 +517,32 @@ class BaseBot:
         else:
             raise RuntimeError("Invalid roll_back_units")
         self._clients = []
+        self.use_hiveengine = use_hiveengine
+        self._engine_clients = []
         # Read in the config that we need for API probing
         probepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.json")
         with open(probepath, encoding="utf-8") as jsonfile:
             probes = json.load(jsonfile)
             self.api_list = list(probes.keys())
+        hivenodepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hive-nodes.json")
+        with open(hivenodepath, encoding="utf-8") as jsonfile:
+            api_nodes = json.load(jsonfile)
+        enginenodepath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "engine-nodes.json")
+        with open(enginenodepath, encoding="utf-8") as jsonfile:
+            engine_nodes = json.load(jsonfile)
+            engine_nodes = [[x, ""] if isinstance(x, str) else x for x in engine_nodes]
+        engineapipath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine-api.json")
+        with open(engineapipath, encoding="utf-8") as jsonfile:
+            self._engine_api_structure = json.load(jsonfile)
         self._abandon = False
         # Create a collection of public API node clients, one for each node.
-        for public_api_node in [
-                "api.hive.blog",
-                "api.deathwing.me",
-                "hive-api.arcange.eu",
-                "hived.emre.sh",
-                "api.openhive.network",
-                "rpc.ausbit.dev",
-                "rpc.mahdiyari.info",
-                "hive-api.3speak.tv",
-                "anyx.io",
-                "techcoderx.com",
-                "api.hive.blue",
-                "hived.privex.io",
-                "hive.roelandp.nl"]:
+        for public_api_node in api_nodes:
             self._clients.append(_PubNodeClient(public_api_node, probes, self))
+        if self.use_hiveengine:
+            # Create extra collection for hive-engine nodes
+            for public_api_node in engine_nodes:
+                self._engine_clients.append(_EngineClient(public_api_node, self))
 
     # pylint: disable=too-many-arguments
     async def internal_node_status(self,
@@ -437,17 +596,59 @@ class BaseBot:
         if self.abort_block:
             self.abort()
 
-    async def run(self, loop, other_tasks=None):
-        """Run all of the API node clients as seperate tasks untill all are explicitly abandoned"""
-        tasks = []
-        # Add any aditinal tasks, this is meant for things like web servers
-        # running in the same async process.
-        if other_tasks is not None:
-            tasks = other_tasks.copy()
-        # Add all of the API node clients as tasks.
+    def wire_up_get_runnables(self):
+        """Get runnables with an async run ans synchonous abort method"""
+        runnables = []
         for nodeclient in self._clients:
-            tasks.append(loop.create_task(nodeclient.run()))
-        # Wait for all tasks to complete
+            runnables.append(nodeclient)
+        for nodeclient in self._engine_clients:
+            runnables.append(nodeclient)
+        return runnables
+
+    def wire_up_get_tasks(self):
+        """Get all runnables as tasks"""
+        tasks = []
+        for runnable in self.wire_up_get_runnables():
+            tasks.append(asyncio.create_task(runnable.run()))
+        return tasks
+
+    def wire_up_on_startup(self):
+        """Get all runnables as tasks, and tuck them away"""
+        self._alltasks = self.wire_up_get_tasks()
+
+    async def wire_up_on_shutdown_async(self):
+        """Abort all the runnable tasks and gather all their tasks"""
+        self.abort()
+        tasks = self._alltasks
+        await asyncio.gather(*tasks)
+
+    def wire_up_sanic(self, app):
+        """Non-ideal wire-up for sanic apps, no abort for sanic, don't use"""
+        for runnable in self.wire_up_get_runnables():
+            app.add_task(runnable.run)
+
+    def wire_up_aiohttp(self, app):
+        """A simle wire-up function for aiohttp apps"""
+        class IgnoreApp:
+            """Helper class that idnores the app argument used by aiohttp"""
+            # pylint: disable=too-few-public-methods
+            def __init__(self, runnable, make_task=False):
+                self.runnable = runnable
+                self.make_task = make_task
+
+            async def __call__(self, app, make_task=False):
+                if self.make_task:
+                    asyncio.create_task(self.runnable())
+                else:
+                    self.runnable()
+
+        for runnable in self.wire_up_get_runnables():
+            app.on_startup.append(IgnoreApp(runnable.run, True))
+            app.on_cleanup.append(IgnoreApp(runnable.abort))
+
+    async def run(self):
+        """Run all of the API node clients as seperate tasks untill all are explicitly abandoned"""
+        tasks = self.wire_up_get_tasks()
         await asyncio.gather(*tasks)
 
     async def _process_notify(self, operation, tid, transaction, block, client_info, timestamp):
@@ -651,4 +852,6 @@ class BaseBot:
         """Abort async operations in all running tasks"""
         self._abandon = True
         for client in self._clients:
+            client.abort()
+        for client in self._engine_clients:
             client.abort()

@@ -15,7 +15,7 @@
       "one": false
     }]
   ],
-  "nft": {
+  "nft": [
     ["params", {
       "one": true
     }],
@@ -26,10 +26,10 @@
     ["pendingUndelegations", {
       "one": true,
       "args": ["symbol"]
-    }]
+    }],
     ["CELLinstances", {
       "one": false,
       "args": ["ownedBy", "symbol"]
     }]
-  }
+  ]
 }
