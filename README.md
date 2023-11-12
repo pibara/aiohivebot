@@ -1,3 +1,3 @@
 # aiohivebot
 
-* [blog post](https://peakd.com/@pibara/aiohivebot-progress-report-closing-in-on-a-first-release) on aiohivebot.
+* [blog posts](https://peakd.com/created/aiohivebot) on aiohivebot.
