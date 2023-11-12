@@ -13,7 +13,7 @@ class MyBot(BaseBot):
                 data = json.load(persistent)
         except FileNotFoundError:
             data = {"block": None}
-        super().__init__(start_block=data["block"])
+        super().__init__(start_block=data["block"], use_irreversable=True)
 
     async def block_processed(self,blockno, timestamp):
         print(blockno, datetime.datetime.utcnow() - timestamp )
