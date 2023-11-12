@@ -7,7 +7,7 @@ import math
 import httpx
 from average import EWMA
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 class JsonRpcError(Exception):

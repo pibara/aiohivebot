@@ -351,14 +351,22 @@ class BaseBot:
                                    layer2=""):
         """This callback forwards hourly node status to the bot implementation if
         callback is defined"""
-
-        await self.forwarder(layer2).node_status(
-                node_uri=node_uri,
-                error_percentage=error_percentage,
-                latency=latency,
-                ok_rate=ok_rate,
-                error_rate=error_rate,
-                block_rate=block_rate)
+        if layer2:
+            await self.forwarder(layer2).l2_node_status(
+                    node_uri=node_uri,
+                    error_percentage=error_percentage,
+                    latency=latency,
+                    ok_rate=ok_rate,
+                    error_rate=error_rate,
+                    block_rate=block_rate)
+        else:
+            await self.forwarder.node_status(
+                    node_uri=node_uri,
+                    error_percentage=error_percentage,
+                    latency=latency,
+                    ok_rate=ok_rate,
+                    error_rate=error_rate,
+                    block_rate=block_rate)
 
     async def internal_node_api_support(self, node_uri, api_support, layer2=""):
         """This callback forwards hourly node API support to the bot implementation
@@ -624,7 +632,7 @@ class BaseBot:
         else:
             timestamp = datetime.datetime.fromtimestamp(0)
         # If the derived class has a "block" callback, invoke it
-        await self.forwarder(layer2).block(
+        await self.forwarder(layer2).l2_block(
                 blockno=blockno,
                 block=block,
                 client_info=client_info,
@@ -636,7 +644,7 @@ class BaseBot:
                 block=block,
                 client_info=client_info,
                 timestamp=timestamp)
-        await self.forwarder(layer2).block_processed(
+        await self.forwarder(layer2).l2_block_processed(
                 blockno=blockno,
                 client_info=client_info,
                 timestamp=timestamp)
