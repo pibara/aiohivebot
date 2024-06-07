@@ -171,8 +171,11 @@ async def process_engine_event(
         actions = []
     for action in actions:
         if ('contractName' in action and
+                action["contractName"] and
                 'contractAction' in action and
-                'contractPayload' in action):
+                action["contractAction"] and
+                'contractPayload' in action and
+                action["contractPayload"]):
             methodname = action["contractName"] + "_" + action["contractAction"]
             await getattr(forwarder, methodname)(
                     required_auths=required_auths,

@@ -10,19 +10,6 @@ class MyBot(BaseBot):
         super().__init__()
         self.count = 0
 
-    async def vote_operation(self, body):
-        """Handler for cote_operation type operations in the HIVE block stream"""
-        if "voter" in body and "author" in body and "permlink" in body:
-            try: 
-                content = await self.bridge.get_post(author=body["author"], permlink=body["permlink"])
-                if content and "is_paidout" in content and content["is_paidout"]:
-                    pass
-                if self.count == 1000000:
-                    self.abort()
-                self.count += 1
-            except (NoResponseError, JsonRpcError) as exp:
-                print(exp)
-
     async def node_status(self, node_uri, error_percentage, latency, ok_rate, error_rate, block_rate):
         print("STATUS:", node_uri, "error percentage =", int(100*error_percentage)/100,
                 "latency= ", int(100*latency)/100,

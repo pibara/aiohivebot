@@ -5,10 +5,14 @@ import time
 import json
 import os
 import math
+import struct
 import datetime
 import inspect
+from binascii import unhexlify, hexlify
+from base58 import b58encode, b58decode
 from dateutil import parser
 import httpx
+from ellipticcurve.privateKey import PrivateKey
 from average import EWMA
 from aiohivebot.l2 import makel2client, l2names, process_l2_event, layer2_multinode_client
 from aiohivebot.l2 import l2_process_block
@@ -47,7 +51,7 @@ class FunctionForwarder:
         unknown = self.args - set(kwargs.keys())
         if self._bot is None:
             if unknown:
-                raise ValueError("Non standard named arguments for method:" + str(list(unknown)))
+                raise ValueError("Non standard named arguments for method:" + str(list(unknown)), ", expected:", list(kwargs.keys()))
             await self.method(**kwargs)
         else:
             try:
@@ -99,11 +103,35 @@ class ObjectForwarder:
             return self._subs[layer2]
         return self
 
+class Operation:
+    """Represents a single operation within a transaction"""
+    def __init__(self, transaction, opname):
+        self.transaction=transaction
+        self.opname=opname
+
+    def __call__(self, *args, **kwargs):
+        self.transaction.operations.append([self.opname, kwargs])
+        return self.transaction
+
+class Transaction:
+    """Transaction helper class"""
+    def __init__(self, bot, key_id):
+        self.bot = bot
+        self.key_id = key_id
+        self.operations = []
+
+    def __getattr__(self, opname):
+        return Operation(self, opname)
+
+    async def __call__(self):
+        if not self.operations:
+            raise RuntimeError("Can't call an empty transaction")
+        await self.bot.internal_transaction(key_id=self.key_id, operations=self.operations)
 
 class _PubNodeClient(JsonRpcClient):
     """Client that keeps up with a single public HIVE-API node"""
     # pylint: disable=too-many-instance-attributes
-    def __init__(self, nodeurl, probes, bot):
+    def __init__(self, nodeurl, probes, bot, config):
         super().__init__(
                 public_api_node=nodeurl,
                 public_api_path="",
@@ -111,7 +139,8 @@ class _PubNodeClient(JsonRpcClient):
                 bot=bot,
                 layer2="",
                 probe_time=3,
-                reinit_time=900
+                reinit_time=900,
+                config=config
             )
         self._api_list = []
         self._probes = probes
@@ -203,6 +232,17 @@ class _PubNodeClient(JsonRpcClient):
         except (JsonRpcError, NoResponseError):
             return None
 
+    async def get_block_range(self, blockno, count):
+        """Get a specific block range from this node's block_api"""
+        self._stats["block_range"] += 1
+        try:
+            return await self.retried_request(method="block_api.get_block_range",
+                                              params={"starting_block_num": blockno,
+                                                  "count": count})
+        except (JsonRpcError, NoResponseError):
+            return None
+
+
     async def heartbeat(self):
         if "condenser_api" in self._api_list:
             try:
@@ -213,9 +253,13 @@ class _PubNodeClient(JsonRpcClient):
                 dynprob = None
             if (dynprob is not None and
                     "head_block_number" in dynprob and
-                    "last_irreversible_block_num" in dynprob):
+                    "last_irreversible_block_num" in dynprob and
+                    "head_block_id" in dynprob and
+                    "time" in dynprob):
                 headblock = dynprob["head_block_number"]
+                headblock_id = dynprob["head_block_id"]
                 irrblock = dynprob["last_irreversible_block_num"]
+                timestamp = parser.parse(dynprob["time"])
                 if not self._abandon:
                     # Tell the BaseBot what the last block available on this node is.
                     error_rate = self._stats["error_rate"].get()
@@ -232,7 +276,9 @@ class _PubNodeClient(JsonRpcClient):
                             headblock,
                             irrblock,
                             self,
-                            client_info)
+                            client_info,
+                            headblock_id,
+                            timestamp)
 
 
 class _Method:
@@ -271,6 +317,39 @@ class _Layer2APIs:
         return self.bot.get_layer2_api(api)
 
 
+class Signer:
+    """Signer for signed operations"""
+    def __init__(self, bot, key):
+        self.bot=bot
+        self.key=PrivateKey.fromString(hexlify(b58decode(key)[1:-4]))
+        self.blockno = None
+        self.ref_block_num = None
+        self.ref_block_prefix=None
+        self.expiration = datetime.datetime.fromtimestamp(0)
+
+    def update_signing_reference(self, blockno, blockid, timestamp):
+        if self.blockno is None or blockno > self.blockno:
+            self.blockno = blockno
+            self.ref_block_num = blockno & 0xFFFF
+            self.ref_block_prefix = struct.unpack_from("<I", unhexlify(blockid), 4)[0]
+            self.expiration = timestamp + datetime.timedelta(seconds=30)
+            print(self.expiration, self.ref_block_num, self.ref_block_prefix)
+
+    async def transaction(self, operations):
+        tx = {
+                "ref_block_num": self.ref_block_num,
+                "ref_block_prefix": self.ref_block_prefix,
+                "expiration": self.expiration.strftime('%Y-%m-%dT%H:%M:%S%Z'),
+                "operations": operations,
+                "extensions": [],
+                "signatures": []
+            }
+        print(json.dumps(tx, indent=2))
+        transhex = await self.bot.condenser_api.get_transaction_hex(tx)
+        print("transhex:", transhex)
+
+
+
 class BaseBot:
     """This classe should be subclassed by the actual bot. It connects to all
     the public HIVE API nodes, streams the blocks, trnasactions and/or operations
@@ -283,7 +362,11 @@ class BaseBot:
                  roll_back_units="blocks",
                  eat_exceptions=False,
                  enable_layer2=None,
-                 use_irreversable=False):
+                 use_irreversable=False,
+                 use_virtual=False,
+                 maintain_order=False,
+                 ratelimit_period=60,
+                 ratelimit_req_per_period=60):
         # pylint: disable=too-many-locals
         self.forwarder = ObjectForwarder(self, eat_exceptions)
         self._block = start_block
@@ -291,6 +374,7 @@ class BaseBot:
         self.roll_back = roll_back
         self.abort_block = None
         self._alltasks = []
+        self._signers = {}
         if roll_back_units == "blocks":
             self.roll_back *= 1
         elif roll_back_units == "minutes":
@@ -309,6 +393,9 @@ class BaseBot:
         else:
             self.enable_layer2 = set(enable_layer2)
         self.use_irreversable = use_irreversable
+        self.use_virtual = use_virtual
+        self.maintain_order = maintain_order
+        self.processing = False
         self._layer2_clients = {}
         # Read in the config that we need for API probing
         probepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.json")
@@ -317,7 +404,8 @@ class BaseBot:
             self.api_list = list(probes.keys())
         hivenodepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hive-nodes.json")
         with open(hivenodepath, encoding="utf-8") as jsonfile:
-            api_nodes = json.load(jsonfile)
+            api_nodes_config = json.load(jsonfile)
+            api_nodes = list(api_nodes_config.keys())
         for key in self.enable_layer2:
             self._layer2_clients[key] = []
             l2nodepath = os.path.join(
@@ -338,7 +426,9 @@ class BaseBot:
         self._abandon = False
         # Create a collection of public API node clients, one for each node.
         for public_api_node in api_nodes:
-            self._clients.append(_PubNodeClient(public_api_node, probes, self))
+            self._clients.append(_PubNodeClient(public_api_node, probes, self, config=api_nodes_config[public_api_node]))
+        self.block_counter = 0
+        self.start = time.time()
 
     # pylint: disable=too-many-arguments
     async def internal_node_status(self,
@@ -375,10 +465,12 @@ class BaseBot:
                 node_uri=node_uri,
                 api_support=api_support)
 
-    async def internal_potential_block(self, block, irrblock, nodeclient, client_info):
+    async def internal_potential_block(self, block, irrblock, nodeclient, client_info,
+            headblock_id, timestamp):
         """This is the callback used by the node clients to tell the BaseBot about the latest
         known block on a node. If there are new blocks that arent processed yet, the client is
         asked to fetch the blocks"""
+        self.update_signing_reference(blockno=block, blockid=headblock_id, timestamp=timestamp)
         if self.use_irreversable:
             block = irrblock
         # If there is no known last block, consider this one minus one to be the last block
@@ -388,21 +480,39 @@ class BaseBot:
                 self.abort_block = block
         # If the providing node is reliable (95% OK) and fast (less than half a second latency)
         # go and see if we can fetch some blocks
-        if block > self._block and nodeclient.api_check("block_api", 0.05, 0.5):
-            for blockno in range(self._block + 1, block + 1):
-                # Don't "start" fetching blocks out of order, this doesn't mean,
-                # we allow other loops to go and fetch the same block to minimize
-                # chain to API latency.
-                if blockno - self._block == 1:
-                    # Fetch a single block
-                    wholeblock = await nodeclient.get_block(blockno)
-                    # If no other eventloop beat us to it, process the new block
-                    if (blockno - self._block == 1
-                            and wholeblock is not None
-                            and "block" in wholeblock):
-                        self._block += 1
-                        # Process the actual block
-                        await self._process_block(blockno, wholeblock["block"].copy(), client_info)
+        if (block > self._block and nodeclient.api_check("block_api", 0.05, 0.5) and 
+                (self.maintain_order == False or self.processing == False))  :
+            if block - self._block < 20 or nodeclient.config["single_block"]:
+                for blockno in range(self._block + 1, block + 1):
+                    # Don't "start" fetching blocks out of order, this doesn't mean,
+                    # we allow other loops to go and fetch the same block to minimize
+                    # chain to API latency.
+                    if blockno - self._block == 1:
+                        # Fetch a single block
+                        wholeblock = await nodeclient.get_block(blockno)
+                        # If no other eventloop beat us to it, process the new block
+                        if (blockno - self._block == 1
+                                and wholeblock is not None
+                                and "block" in wholeblock):
+                            self._block += 1
+                            # Process the actual block
+                            self.processing = True
+                            await self._process_block(blockno, wholeblock["block"].copy(), client_info)
+                            self.processing = False
+            else: # There is a lot to catch up with, we get many blocks at once in order to catch up.
+                blockcount = block - self._block - 10
+                if blockcount > 128:
+                    blockcount = 128
+                manyblocks = await nodeclient.get_block_range(self._block + 1, blockcount)
+                if manyblocks is not None and "blocks" in manyblocks and len(manyblocks["blocks"]) == blockcount:
+                    for index in range(0, blockcount):
+                        blockno = self._block + 1 + index
+                        if blockno - self._block == 1:
+                            self._block += 1
+                            self.processing = True
+                            await self._process_block(blockno, manyblocks["blocks"][index].copy(), client_info)
+                            self.processing = False
+
         if self.abort_block:
             self.abort()
 
@@ -616,10 +726,50 @@ class BaseBot:
                                 block=block,
                                 client_info=client_info,
                                 timestamp=timestamp)
+        if self.use_virtual:
+            virtual_ops = await self.account_history_api.get_ops_in_block(
+                    block_num=blockno,
+                    only_virtual=True,
+                    include_reversible=self.use_irreversable)
+            if self._abandon:
+                    return
+            for vop in virtual_ops["ops"]:
+                operation = vop["op"]
+                await self.forwarder.operation(operation=operation,
+                                               tid=vop["trx_id"],
+                                               transaction="VIRTUAL",
+                                               blockno=vop["block"],
+                                               block=block,
+                                               client_info=client_info,
+                                               timestamp=timestamp)
+                if self._abandon:
+                    return
+                if "type" in operation and "value" in operation:
+                    if hasattr(self, operation["type"]):
+                        await getattr(self.forwarder, operation["type"])(
+                                body=operation["value"],
+                                operation=operation,
+                                tid=vop["trx_id"],
+                                transaction="VIRTUAL",
+                                blockno=block,
+                                block=block,
+                                client_info=client_info,
+                                timestamp=timestamp)
+                        if self._abandon:
+                            return
         await self.forwarder.block_processed(
                 blockno=blockno,
                 client_info=client_info,
                 timestamp=timestamp)
+        await self._block_processed()
+
+    async def _block_processed(self):
+        self.block_counter += 1
+        age = time.time() -  self.start
+        if age >= 60:
+            await self.forwarder.monitor_block_rate(rate=int(self.block_counter * 100 / age)/100)
+            self.block_counter = 0
+            self.start = time.time()
 
     async def _process_block_l2(self, layer2, blockno, block, client_info):
         """Process a brand new block"""
@@ -653,9 +803,42 @@ class BaseBot:
         """The __getattr__ method provides the sub-API's."""
         if attr == "l2":
             return _Layer2APIs(self)
+        if attr == "broadcast":
+            if "default" in self._signers:
+                key_id = "default"
+            elif len(self._signers) == 1:
+                key_id = list(self._signers.keys())[0]
+            elif self._signers:
+                raise RuntimeError("No broadcast when using multipte keys and no default,"
+                        "use start_transaction method instead and specify key id.")
+            else:
+                raise RuntimeError("No broadcast when zero keys defined for bot")
+            return Transaction(self, key_id)
         if attr in self.api_list or attr == "network_broadcast_api":
             return _SubAPI(self, attr)
         raise AttributeError(f"Basebot has no sub-API {attr}")
+
+    def start_transaction(self, key_id=None):
+        """Start building a new transaction"""
+        if not self._signers:
+            raise RuntimeError("No start_transaction when zero keys defined for bot")
+        if key_id is None:
+            if "default" in self._signers:
+                my_key_id = "default"
+            elif len(self._signers) == 1:
+                my_key_id = list(self._signers.keys())[0]
+            else:
+                raise RuntimeError("No key_id defined while using multipte keys and no default")
+        else:
+            if key_id not in self._signers:
+                raise RuntimeError("Specified key_id not defined for bot")
+            my_key_id = key_id
+        return Transaction(self, key_id)
+
+    async def internal_transaction(self, key_id,  operations):
+        """Sign and broadcast a list of operations as a transaction""" 
+        await self._signers[key_id].transaction(operations)
+        
 
     def get_layer2_api(self, api):
         """Get the layer-2 API as a helper object"""
@@ -725,10 +908,16 @@ class BaseBot:
             raise last_exception
         raise NoResponseError("No valid response from any node""")
 
+    def set_key(self, key, identity="default"):
+        self._signers[identity] = Signer(bot=self, key=key)
+
+    def update_signing_reference(self, blockno, blockid, timestamp):
+        """Update the signing reference for all active signers"""
+        for _, signer in self._signers.items():
+            signer.update_signing_reference(blockno=blockno, blockid=blockid, timestamp=timestamp)
+
     def abort(self):
         """Abort async operations in all running tasks"""
         self._abandon = True
         for client in self._clients:
-            client.abort()
-        for client in self._engine_clients:
             client.abort()

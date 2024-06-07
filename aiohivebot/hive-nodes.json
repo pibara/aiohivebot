@@ -1,15 +1,42 @@
-[
-  "api.hive.blog",
-  "api.deathwing.me",
-  "hive-api.arcange.eu",
-  "hived.emre.sh",
-  "api.openhive.network",
-  "rpc.ausbit.dev",
-  "rpc.mahdiyari.info",
-  "hive-api.3speak.tv",
-  "anyx.io",
-  "techcoderx.com",
-  "api.hive.blue",
-  "hived.privex.io",
-  "hive.roelandp.nl"
-]
+{
+  "api.hive.blog": {
+    "rate": 150
+  },
+  "api.deathwing.me": {
+    "rate": 150
+  },
+  "hive-api.arcange.eu": {
+    "rate": 150
+  },
+  "hived.emre.sh": {
+    "rate": 150
+  },
+  "api.openhive.network": {
+    "rate": 150
+  },
+  "rpc.ausbit.dev": {
+    "rate": 150
+  },
+  "rpc.mahdiyari.info": {
+    "rate": 150
+  },
+  "hive-api.3speak.tv": {
+    "rate": 150
+  },
+  "anyx.io": {
+    "single_block": true,
+    "rate": 150
+  },
+  "techcoderx.com": {
+    "rate": 150
+  },
+  "api.hive.blue": {
+    "rate": 150
+  },
+  "hived.privex.io": {
+    "rate": 150
+  },
+  "hive.roelandp.nl": {
+    "rate": 150
+  }
+}

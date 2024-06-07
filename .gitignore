@@ -1,0 +1,4 @@
+dist/
+**/__pycache__
+aiohivebot.egg-info
+persistent.json
