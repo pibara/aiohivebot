@@ -25,70 +25,121 @@ class NoResponseError(Exception):
     """Exception for when none of the nodes gave a valid response"""
 
 
-class _RateLimit:
-    def __init__(self, period, req_per_period, node):
-        self.period = period
-        self.req_per_period = req_per_period
+class _RateLimitingPolicy:
+    def __init__(self, policy, starttime):
+        self.time_window = policy["w"]
+        self.quota = policy["v"]
+        self.remaining = self.quota
+        self.reset = starttime + self.time_window
+
+    def update(self, now):
+        self.remaining -= 1
+        if self.remaining < 0:
+            self.remaining = 0
+        if now >= self.reset:
+            self.reset = now + self.time_window
+            self.remaining = self.quota -1
+
+    def rate(self, now):
+        if self.reset <= now:
+            return self.quota / self.time_window
+        if self.remaining == 0:
+            return None
+        return self.remaining / (self.reset - now)
+
+    def get(self, now):
+        if self.reset <= now:
+            return self.quota / self.time_window, self.quota, self.quota, now + self.time_window, self.time_window
+        if self.remaining == 0:
+            return None, self.quota, self.remaining, self.reset, self.time_window
+        return self.remaining / (self.reset - now), self.quota, self.remaining, self.reset, self.time_window
+
+
+class _RateLimitingPolicies:
+    """A simple class that simulates a HTTP server with rate limiting policies."""
+    def __init__(self, policies):
+        self.policies = []
+        now = time.time()
+        for policy in policies:
+            self.policies.append(_RateLimitingPolicy(policy, now))
+
+    def update(self):
+        now = time.time()
+        for policy in self.policies:
+            policy.update(now)
+
+    def get(self):
+        now = time.time()
+        best_policy = None
+        best_limit = None
+        best_remaining = None
+        best_reset = None
+        best_time_window = None
+        for policy in self.policies:
+            # The first one id always the best of one
+            if best_policy is None:
+                best_policy = policy
+                best_rate, best_limit, best_remaining, best_reset, best_time_window = policy.get(now)
+            else:
+                rate, limit, remaining, reset, time_window = policy.get(now)
+                # If one policy is exausted, we must return the best exausted policy no matter what
+                if best_rate is None:
+                    if rate is None:
+                        # If both candidates are exausted, the one with the furthest reset is the one we need
+                        if best_reset < reset:
+                            best_policy = policy
+                            best_rate, best_limit, best_remaining, best_reset, best_time_window = policy.get(now)
+                else:
+                    # If the old best isn't exausted and the new candidate is, choos the exausted policy
+                    if rate is None:
+                        best_policy = policy
+                        best_rate, best_limit, best_remaining, best_reset, best_time_window = policy.get(now)
+                    else:
+                        # If neither policy is exausted, pick the one with the lowest remaining value
+                        if best_remaining > remaining:
+                            best_policy = policy
+                            best_rate, best_limit, best_remaining, best_reset, best_time_window = policy.get(now)
+                        # if both remaining values are the same, pick the one with the furthest window end.
+                        elif best_remaining == remaining and best_reset < reset:
+                            best_policy = policy
+                            best_rate, best_limit, best_remaining, best_reset, best_time_window = policy.get(now)
+        return best_limit, best_remaining, best_reset, best_time_window
+
+class _RateLimitClient:
+    def __init__(self, policies, node):
+        self.simulator = _RateLimitingPolicies(policies)
         self.node = node
-        self.simulated = True
-        self.limit = req_per_period
-        self.remaining = req_per_period
-        self.reset = time.time() + period
-        self.creation = time.time()
-        self.interval = time.time()
-        self.total_count = 0
+        self.limit, self.remaining, self.reset, self.time_window = self.simulator.get()
 
-    def _ll_update(self, limit=None, remaining=None, reset=None):
-        if remaining is None:
-            self.remaining -= 1
-            if self.reset - time.time() <= 0.0:
-                self.reset = time.time() + self.period
-                self.remaining = self.req_per_period -1
-        else:
-            self.remaining = remaining
-        if reset is not None:
-            self.reset = time.time() + reset
-        if limit is not None:
-            self.limit = limit
-        if self.simulated and self.limit is not None and reset is not None:
-            self.simulated = False
-            self.period = reset
-            self.req_per_period = self.remaining + 1
-        if not self.simulated and reset is not None and reset is not None and self.period < reset:
-            self.period = reset
-
-    def update(self, headers):
-        limit = headers.get("RateLimit-Limit", None)
-        remaining = headers.get("RateLimit-Remaining",None)
-        reset = headers.get("RateLimit-Reset", None)
-        if limit is not None and limit.isnumeric():
-            limit=int(limit)
-        else:
-            limit = None
-        if remaining is not None and remaining.isnumeric():
-            remaining=int(limit)
-        else:
-            remaining = None
-        if reset is not None and reset.isnumeric():
-            reset = int(limit)
-        else:
-            reset = None
-        self._ll_update(limit, remaining, reset)
-        self.total_count += 1
-        if self.total_count % 100 == 0:
-            now = time.time()
-            speed_all = self.total_count/(now - self.creation)
-            speed_now = 100 / (now - self.interval)
-            self.interval = time.time()
-            self.interval_count = 0
-            
+    def update(self, headers, code):
+        self.simulator.update()
+        self.limit, self.remaining, self.reset, self.time_window = self.simulator.get()
+        unparsed = headers.get("RateLimit", None)
+        retry = headers.get("Retry-After", None)
+        if unparsed is not None:
+            for part in unparsed.split(","):
+                part = part.lstrip()
+                subparts = part.split("=")
+                if len(subparts) == 2 and subparts[1].isnumeric() and subparts[0] in ("limit", "remaining", "reset"):
+                    if subparts[0] == "limit":
+                        self.limit = int(subpart[1])
+                    if subparts[0] == "remaining":
+                        self.remaining = int(subpart[1])
+                    if subparts[0] == "reset":
+                        self.reset = int(subpart[1])
+        elif code == 429:
+            self.remaining = 0
+            if retry is not None and retry.isnumeric():
+                self.reset = time.time() + int(retry)
+        if self.remaining == 0 and self.reset - time.time() > 900:
+            self.reset = time.time() + 900
 
     def predicted_sleep(self):
         if self.reset - time.time() <= 0:
             return None
         if self.remaining == 0:
             return self.reset - time.time() + 0.1
-        flat = (self.period - (self.reset - time.time()))* (self.limit/self.period)
+        flat = (self.time_window - (self.reset - time.time()))* (self.limit/self.time_window)
         spent = self.limit - self.remaining
         ratio = spent/flat
         if ratio <= 1.3 or self.reset - time.time() <= 0.0 or spent <= self.limit/5:
@@ -152,7 +203,7 @@ class JsonRpcClient:
         self._probe_time = probe_time
         self._reinit_time = reinit_time
         self._last_reinit = time.time()
-        self._rate_limit = _RateLimit(period=self.config["period"], req_per_period=self.config["rate"], node=public_api_node)
+        self._rate_limit = _RateLimitClient(policies=self.config["policies"], node=public_api_node)
 
     def predicted_sleep(self):
         psleep = self._rate_limit.predicted_sleep()
@@ -218,7 +269,7 @@ class JsonRpcClient:
                 self._stats["error_rate"].update(1)
                 self._stats["errors"] += 1
             if req is not None:
-                self._rate_limit.update(req.headers)
+                self._rate_limit.update(req.headers, code=req.status_code)
                 # HTTP action has completed, update the latency decaying average.
                 self._stats["latency"].update(time.time() - start_time)
                 if req.status_code == 200:
