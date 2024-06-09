@@ -10,7 +10,7 @@ class MyBot(BaseBot):
     """Example of an aiohivebot python bot without real utility"""
     def __init__(self):
         jan2024=82316952
-        super().__init__(jan2024, use_virtual=True, maintain_order=False, ratelimit_req_per_period=150)
+        super().__init__(jan2024, use_virtual=False, maintain_order=False)
         self.seen = set()
         self.tfields = set()
 
