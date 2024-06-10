@@ -438,6 +438,8 @@ class BaseBot:
                                    ok_rate,
                                    error_rate,
                                    block_rate=0,
+                                   rate_limit_status={},
+                                   detailed_error_status={},
                                    layer2=""):
         """This callback forwards hourly node status to the bot implementation if
         callback is defined"""
@@ -448,7 +450,9 @@ class BaseBot:
                     latency=latency,
                     ok_rate=ok_rate,
                     error_rate=error_rate,
-                    block_rate=block_rate)
+                    block_rate=block_rate,
+                    rate_limit_status=rate_limit_status,
+                    detailed_error_status=detailed_error_status)
         else:
             await self.forwarder.node_status(
                     node_uri=node_uri,
@@ -456,7 +460,10 @@ class BaseBot:
                     latency=latency,
                     ok_rate=ok_rate,
                     error_rate=error_rate,
-                    block_rate=block_rate)
+                    block_rate=block_rate,
+                    rate_limit_status=rate_limit_status,
+                    detailed_error_status=detailed_error_status
+                    )
 
     async def internal_node_api_support(self, node_uri, api_support, layer2=""):
         """This callback forwards hourly node API support to the bot implementation
@@ -483,36 +490,43 @@ class BaseBot:
         if (block > self._block and nodeclient.api_check("block_api", 0.05, 0.5) and 
                 (self.maintain_order == False or self.processing == False))  :
             if block - self._block < 20 or nodeclient.config["single_block"]:
-                for blockno in range(self._block + 1, block + 1):
+                start_block = self._block + 1
+                blockcount = block - start_block + 1
+                if blockcount > 16:
+                    blockcount = 16
+                blocks = []
+                count = 0
+                for blockno in range(start_block, start_block + blockcount):
                     # Don't "start" fetching blocks out of order, this doesn't mean,
-                    # we allow other loops to go and fetch the same block to minimize
+                    # we don't allow other loops to go and fetch the same block to minimize
                     # chain to API latency.
-                    if blockno - self._block == 1:
-                        # Fetch a single block
+                    if blockno - self._block > 0:
                         wholeblock = await nodeclient.get_block(blockno)
-                        # If no other eventloop beat us to it, process the new block
-                        if (blockno - self._block == 1
-                                and wholeblock is not None
+                        if (blockno - self._block == 1 and 
+                                (self.maintain_order == False or self.processing == False) and
+                                wholeblock is not None
                                 and "block" in wholeblock):
                             self._block += 1
-                            # Process the actual block
                             self.processing = True
                             await self._process_block(blockno, wholeblock["block"].copy(), client_info)
                             self.processing = False
+                            count +=1
             else: # There is a lot to catch up with, we get many blocks at once in order to catch up.
                 blockcount = block - self._block - 10
                 if blockcount > 128:
                     blockcount = 128
+                count = 0
                 manyblocks = await nodeclient.get_block_range(self._block + 1, blockcount)
                 if manyblocks is not None and "blocks" in manyblocks and len(manyblocks["blocks"]) == blockcount:
+                    startblock = self._block + 1
                     for index in range(0, blockcount):
-                        blockno = self._block + 1 + index
+                        blockno = startblock + index
                         if blockno - self._block == 1:
                             self._block += 1
                             self.processing = True
                             await self._process_block(blockno, manyblocks["blocks"][index].copy(), client_info)
                             self.processing = False
-
+                            count += 1
         if self.abort_block:
             self.abort()
 

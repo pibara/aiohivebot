@@ -8,11 +8,13 @@
     ]
   },
   "api.deathwing.me": {
+    "note": "@deathwing reported using a 50 calls/second policy and using 429/Retry-After", 
     "policies": [
-            {"w": 60, "v": 240},
-            {"w": 600, "v": 1800},
-            {"w": 3600, "v": 9000},
-            {"w": 10800, "v": 21600}
+	    {"w": 2, "v": 100},
+            {"w": 60, "v": 2400},
+            {"w": 600, "v": 18000},
+            {"w": 3600, "v": 90000},
+            {"w": 10800, "v": 216000}
     ]
   },
   "hive-api.arcange.eu": {
@@ -97,6 +99,7 @@
     ]
   },
   "hive.roelandp.nl": {
+    "single_block": true,
     "policies": [
             {"w": 60, "v": 240},
             {"w": 600, "v": 1800},

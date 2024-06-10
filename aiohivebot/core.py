@@ -110,13 +110,24 @@ class _RateLimitClient:
         self.simulator = _RateLimitingPolicies(policies)
         self.node = node
         self.limit, self.remaining, self.reset, self.time_window = self.simulator.get()
+        self.status = {}
+        self.clear_status()
+
+    def clear_status(self):
+        self.status["count"] = 0
+        self.status["uses_ratelimit_header"] = False
+        self.status["used_429"] = False
+        self.status["used_retry_header"] = False
+        self.status["total_ratelimit_sleeptime"] = 0.0
 
     def update(self, headers, code):
         self.simulator.update()
+        self.status["count"] += 1
         self.limit, self.remaining, self.reset, self.time_window = self.simulator.get()
         unparsed = headers.get("RateLimit", None)
         retry = headers.get("Retry-After", None)
         if unparsed is not None:
+            self.status["uses_ratelimit_header"] = True
             for part in unparsed.split(","):
                 part = part.lstrip()
                 subparts = part.split("=")
@@ -128,8 +139,10 @@ class _RateLimitClient:
                     if subparts[0] == "reset":
                         self.reset = int(subpart[1])
         elif code == 429:
+            self.status["used_429"] = False
             self.remaining = 0
             if retry is not None and retry.isnumeric():
+                self_status["used_retry_header"] = True
                 self.reset = time.time() + int(retry)
         if self.remaining == 0 and self.reset - time.time() > 900:
             self.reset = time.time() + 900
@@ -149,6 +162,7 @@ class _RateLimitClient:
     async def sleep(self):
         sleeptime = self.predicted_sleep()
         if sleeptime is not None:
+            self.status["total_ratelimit_sleeptime"] += sleeptime
             await asyncio.sleep(sleeptime)
 
 
@@ -163,7 +177,7 @@ class JsonRpcClient:
             public_api_path_2=None,
             layer2="",
             probe_time=3,
-            reinit_time=900,
+            reinit_time=900,  # 15 minutes
             config={}):
         headers = {
                 "user-agent": "aiohivebot-/" + VERSION,
@@ -197,6 +211,7 @@ class JsonRpcClient:
         self._stats["errors"] = 0
         self._stats["blocks"] = 0
         self._stats["block_range"] = 0
+        self._stats["detailed_error_stats"] = {}
         self._abandon = False
         self._active = False
         self._id = 0
@@ -247,6 +262,11 @@ class JsonRpcClient:
             }
         jsonrpc_json = json.dumps(jsonrpc)
         tries = 0
+        if full_method not in self._stats["detailed_error_stats"]:
+            self._stats["detailed_error_stats"][full_method] = {}
+            self._stats["detailed_error_stats"][full_method]["http-error"] = 0
+            self._stats["detailed_error_stats"][full_method]["ssl-error"] = 0
+            self._stats["detailed_error_stats"][full_method]["code"] = {}
         # The main retry loop, note we also stop (prematurely) after _abandon is
         # set.
         while (max_retry == -1 and not self._abandon or
@@ -265,10 +285,15 @@ class JsonRpcClient:
                 # decaying average
                 self._stats["error_rate"].update(1)
                 self._stats["errors"] += 1
+                self._stats["detailed_error_stats"][full_method]["http-error"] += 1
             except ssl.SSLError:
                 self._stats["error_rate"].update(1)
                 self._stats["errors"] += 1
+                self._stats["detailed_error_stats"][full_method]["ssl-error"] += 1
             if req is not None:
+                if req.status_code not in self._stats["detailed_error_stats"][full_method]["code"]:
+                    self._stats["detailed_error_stats"][full_method]["code"][req.status_code] = 0
+                self._stats["detailed_error_stats"][full_method]["code"][req.status_code] += 1
                 self._rate_limit.update(req.headers, code=req.status_code)
                 # HTTP action has completed, update the latency decaying average.
                 self._stats["latency"].update(time.time() - start_time)
@@ -286,6 +311,11 @@ class JsonRpcClient:
                     # increase, uses decaying average
                     self._stats["error_rate"].update(1)
                     self._stats["errors"] += 1
+                    #print("##############################")
+                    #print("#    ERROR", req.status_code, "              #")
+                    #print("##############################")
+                    #print(req.text)
+                    #print("##############################")
             if rjson is not None:
                 if "error" in rjson and "jsonrpc" in rjson:
                     # A JSON-RPC error is likely still a valid response, so doesn't
@@ -351,6 +381,8 @@ class JsonRpcClient:
                                                      ok_rate=60 * ok_rate,
                                                      error_rate=60 * error_rate,
                                                      block_rate=60 * block_rate,
+                                                     rate_limit_status = self._rate_limit.status.copy(),
+                                                     detailed_error_status = self._stats["detailed_error_stats"].copy(),
                                                      layer2=self._layer2)
                 self._active = False
                 await self.initialize_api()
@@ -358,6 +390,8 @@ class JsonRpcClient:
                 self._stats["requests"] = 0
                 self._stats["errors"] = 0
                 self._stats["blocks"] = 0
+                self._stats["detailed_error_stats"] = {}
+                self._rate_limit.clear_status()
             await self.heartbeat()
             times = int(self._probe_time)
             while not self._abandon and times > 0:
