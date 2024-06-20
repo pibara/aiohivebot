@@ -1,5 +1,6 @@
 """A multi-eventloop asynchonous python lib for writing HIVE-blockchain bots
 and DApp backend code"""
+# pylint: disable=too-many-lines
 import asyncio
 import contextvars
 import time
@@ -54,7 +55,10 @@ class FunctionForwarder:
         unknown = self.args - set(kwargs.keys())
         if self._bot is None:
             if unknown:
-                raise ValueError("Non standard named arguments for method:" + str(list(unknown)), ", expected:", list(kwargs.keys()))
+                raise ValueError(
+                        "Non standard named arguments for method:" + str(list(unknown)),
+                        ", expected:",
+                        list(kwargs.keys()))
             await self.method(**kwargs)
         else:
             try:
@@ -106,7 +110,7 @@ class ObjectForwarder:
             return self._subs[layer2]
         return self
 
-class Operation:
+class Operation:  # pylint: disable=too-few-public-methods
     """Represents a single operation within a transaction"""
     def __init__(self, transaction, opname):
         self.transaction=transaction
@@ -337,6 +341,7 @@ class Signer:
         self.expiration = datetime.datetime.fromtimestamp(0)
 
     def update_signing_reference(self, blockno, blockid, timestamp):
+        """NYI"""
         if self.blockno is None or blockno > self.blockno:
             self.blockno = blockno
             self.ref_block_num = blockno & 0xFFFF
@@ -345,7 +350,8 @@ class Signer:
             print(self.expiration, self.ref_block_num, self.ref_block_prefix)
 
     async def transaction(self, operations):
-        tx = {
+        """NYI"""
+        trx = {
                 "ref_block_num": self.ref_block_num,
                 "ref_block_prefix": self.ref_block_prefix,
                 "expiration": self.expiration.strftime('%Y-%m-%dT%H:%M:%S%Z'),
@@ -353,8 +359,8 @@ class Signer:
                 "extensions": [],
                 "signatures": []
                 }
-        print(json.dumps(tx, indent=2))
-        transhex = await self.bot.condenser_api.get_transaction_hex(tx)
+        print(json.dumps(trx, indent=2))
+        transhex = await self.bot.condenser_api.get_transaction_hex(trx)
         print("transhex:", transhex)
 
 
@@ -373,9 +379,7 @@ class BaseBot:
             enable_layer2=None,
             use_irreversable=False,
             use_virtual=False,
-            maintain_order=False,
-            ratelimit_period=60,
-            ratelimit_req_per_period=60):
+            maintain_order=False):
         # pylint: disable=too-many-locals
         self.forwarder = ObjectForwarder(self, eat_exceptions)
         self._block = start_block
@@ -447,11 +451,13 @@ class BaseBot:
             ok_rate,
             error_rate,
             block_rate=0,
-            rate_limit_status={},
-            detailed_error_status={},
+            rate_limit_status=None,
+            detailed_error_status=None,
             layer2=""):
         """This callback forwards hourly node status to the bot implementation if
         callback is defined"""
+        rls = rate_limit_status if rate_limit_status is not None else {}
+        des = detailed_error_status if detailed_error_status is not None else {}
         if layer2:
             await self.forwarder(layer2).l2_node_status(
                     node_uri=node_uri,
@@ -460,8 +466,8 @@ class BaseBot:
                     ok_rate=ok_rate,
                     error_rate=error_rate,
                     block_rate=block_rate,
-                    rate_limit_status=rate_limit_status,
-                    detailed_error_status=detailed_error_status)
+                    rate_limit_status=rls,
+                    detailed_error_status=des)
         else:
             await self.forwarder.node_status(
                     node_uri=node_uri,
@@ -470,8 +476,8 @@ class BaseBot:
                     ok_rate=ok_rate,
                     error_rate=error_rate,
                     block_rate=block_rate,
-                    rate_limit_status=rate_limit_status,
-                    detailed_error_status=detailed_error_status
+                    rate_limit_status=rls,
+                    detailed_error_status=des
                     )
 
     async def internal_node_api_support(self, node_uri, api_support, layer2=""):
@@ -481,6 +487,7 @@ class BaseBot:
                 node_uri=node_uri,
                 api_support=api_support)
 
+    # pylint: disable=too-many-branches
     async def internal_potential_block(self, block, irrblock, nodeclient, client_info,
             headblock_id, timestamp):
         """This is the callback used by the node clients to tell the BaseBot about the latest
@@ -496,14 +503,12 @@ class BaseBot:
                 self.abort_block = block
         # If the providing node is reliable (95% OK) and fast (less than half a second latency)
         # go and see if we can fetch some blocks
-        if (block > self._block and nodeclient.api_check("block_api", 0.05, 0.5) and 
-                (self.maintain_order == False or self.processing == False))  :
+        if (block > self._block and nodeclient.api_check("block_api", 0.05, 0.5) and
+                (self.maintain_order is False or self.processing is False))  :
             if block - self._block < 20 or nodeclient.config["single_block"]:
                 start_block = self._block + 1
                 blockcount = block - start_block + 1
-                if blockcount > 16:
-                    blockcount = 16
-                blocks = []
+                blockcount = min(blockcount, 16)
                 count = 0
                 for blockno in range(start_block, start_block + blockcount):
                     # Don't "start" fetching blocks out of order, this doesn't mean,
@@ -511,19 +516,22 @@ class BaseBot:
                     # chain to API latency.
                     if blockno - self._block > 0:
                         wholeblock = await nodeclient.get_block(blockno)
-                        if (blockno - self._block == 1 and 
-                                (self.maintain_order == False or self.processing == False) and
+                        if (blockno - self._block == 1 and
+                                (self.maintain_order is False or self.processing is False) and
                                 wholeblock is not None
                                 and "block" in wholeblock):
                             self._block += 1
                             self.processing = True
-                            await self._process_block(blockno, wholeblock["block"].copy(), client_info, head_block=block, irr_block=irrblock)
+                            await self._process_block(blockno,
+                                                      wholeblock["block"].copy(),
+                                                      client_info,
+                                                      head_block=block,
+                                                      irr_block=irrblock)
                             self.processing = False
                             count +=1
             else: # There is a lot to catch up with, we get many blocks at once in order to catch up.
                 blockcount = block - self._block - 10
-                if blockcount > 128:
-                    blockcount = 128
+                blockcount = min(blockcount, 128)
                 count = 0
                 manyblocks = await nodeclient.get_block_range(self._block + 1, blockcount)
                 if manyblocks is not None and "blocks" in manyblocks and len(manyblocks["blocks"]) == blockcount:
@@ -533,7 +541,11 @@ class BaseBot:
                         if blockno - self._block == 1:
                             self._block += 1
                             self.processing = True
-                            await self._process_block(blockno, manyblocks["blocks"][index].copy(), client_info, head_block=block, irr_block=irrblock)
+                            await self._process_block(blockno,
+                                                      manyblocks["blocks"][index].copy(),
+                                                      client_info,
+                                                      head_block=block,
+                                                      irr_block=irrblock)
                             self.processing = False
                             count += 1
         if self.abort_block:
@@ -686,7 +698,7 @@ class BaseBot:
                     timestamp=timestamp,
                     head_block=head_block,
                     irreversable_block=irreversable_block)
-
+    # pylint: disable=too-many-branches
     async def _process_block(self, blockno, block, client_info, head_block, irr_block):
         """Process a brand new block"""
         behind_blocks_var.set(head_block - blockno)
@@ -815,11 +827,12 @@ class BaseBot:
         if age >= 60:
             behind_head = head_block - self._block
             behind_irreversable = irreversable_block - self._block
-            if behind_head < 0:
-                behind_head=0
-            if behind_irreversable < 0:
-                behind_irreversable = 0
-            await self.forwarder.monitor_block_rate(rate=int(self.block_counter * 100 / age)/100, behind_head=behind_head, behind_irreversable=behind_irreversable)
+            behind_head = max(behind_head, 0)
+            behind_irreversable = max(behind_irreversable, 0)
+            await self.forwarder.monitor_block_rate(
+                    rate=int(self.block_counter * 100 / age)/100,
+                    behind_head=behind_head,
+                    behind_irreversable=behind_irreversable)
             self.block_counter = 0
             self.start = time.time()
 
@@ -885,7 +898,7 @@ class BaseBot:
             if key_id not in self._signers:
                 raise RuntimeError("Specified key_id not defined for bot")
             my_key_id = key_id
-        return Transaction(self, key_id)
+        return Transaction(self, my_key_id)
 
     async def internal_transaction(self, key_id,  operations):
         """Sign and broadcast a list of operations as a transaction""" 
@@ -898,8 +911,10 @@ class BaseBot:
             return layer2_multinode_client(api=api, bot=self)
         raise AttributeError(f"Basebot has no active layer-2 {api}")
 
+    # pylint: disable=unused-argument
     def calculate_client_sort_key(self, error_rate, recent_latency, predicted_ratelimit_sleep,
             projected_ratelimit_window_latency, blocks_behind, api, method, is_block_source):
+        """Default sorting key calculation for sorting available clients"""
         # other nodes might not yet have lhe last block
         if blocks_behind < 2 and api == "account_history_api" and is_block_source:
             return -1.0
@@ -910,36 +925,39 @@ class BaseBot:
         # if we have a high node error rate, scale and increase the sorting value
         if error_rate > 0.2:
             latency *= 1 + error_rate
-            latency += error_rate 
+            latency += error_rate
         return latency
 
-    async def internal_api_call(self, api, method, params):
+    async def internal_api_call(self, api, method, params):  # pylint: disable=too-many-locals
         """This method sets out a JSON-RPC request with the curently most reliable
         and fast node"""
-        # Create a sorted list of node suitability metrics and node clients
-        unsorted = []
-        for client in self._clients:
-            unsorted.append(client.get_api_quality(api))
-        block_source = block_source_var.get()
-        behind_blocks = behind_blocks_var.get()
-        slist = sorted(unsorted, key=lambda x: self.calculate_client_sort_key(x[0],
-                                                                              x[1],
-                                                                              x[2].predicted_sleep(),
-                                                                              x[2].get_projected_ratelimit_window_latency(),
-                                                                              behind_blocks,
-                                                                              api,
-                                                                              method,
-                                                                              block_source == x[2].get_node()))
-        # We give it four tries at most
-        last_exception = None
-        exceptions = []
-        parents = []
-        for _ in range(0, 4):
+        start = time.time()
+        stall_count = 0
+        while True:
+            stall_count += 1
+            # Create a sorted list of node suitability metrics and node clients
+            unsorted = []
+            for client in self._clients:
+                unsorted.append(client.get_api_quality(api))
+            block_source = block_source_var.get()
+            behind_blocks = behind_blocks_var.get()
+            slist = sorted(unsorted, key=lambda x: self.calculate_client_sort_key(x[0],
+                                                                                  x[1],
+                                                                                  x[2].predicted_sleep(),
+                                                                                  x[2].get_projected_ratelimit_window_latency(),
+                                                                                  behind_blocks,
+                                                                                  api,
+                                                                                  method,
+                                                                                  block_source == x[2].get_node()))
+            exceptions = []
+            parents = []
+            node_count = 0
             # Go through the full list of node clients
             for entry in slist:
                 # Don't use nodes with an error rate of two thirds or more,
                 # don'r use nodes with a latency of more than 30 seconds.
                 if entry[0] < 0.667 and entry[1] < 30:
+                    node_count += 1
                     try:
                         # Every node client gets two quick tries.
                         return await entry[2].retried_request(api=api,
@@ -949,45 +967,44 @@ class BaseBot:
                                 retry_pause=0.2)
                     except JsonRpcError as exp:
                         exceptions.append(exp)
-                        last_exception = exp
                     except NoResponseError as exp:
                         parents.append(exp)
-                        pass
+            await self.forwarder.stall_hook(node_count=node_count,
+                                            stall_count=stall_count,
+                                            stall_time=time.time()-start,
+                                            exceptions=exceptions,
+                                            noresponses=parents)
 
-        if last_exception is not None:
-            raise last_exception
-        exc = NoResponseError("No valid response from any node", exceptions=exceptions, node="any", parents=parents)
-        print(slist)
-        exc.dump()
-        raise exc
-
-    async def internal_api_call_l2(self, layer2, api, method, params):
+    async def internal_api_call_l2(self, layer2, api, method, params): # pylint: disable=too-many-locals
         """This method sets out a JSON-RPC request with the curently most reliable
         and fast node"""
-        # Create a sorted list of node suitability metrics and node clients
-        unsorted = []
-        for client in self._layer2_clients[layer2]:
-            unsorted.append(client.get_quality())
-        block_source = block_source_var.get()
-        behind_blocks = behind_blocks_var.get()
-        slist = sorted(unsorted, key=lambda x: self.calculate_client_sort_key(x[0],
-                                                                              x[1],
-                                                                              x[2].predicted_sleep(),
-                                                                              x[2].get_projected_ratelimit_window_latency(),
-                                                                              behind_blocks,
-                                                                              api,
-                                                                              method,
-                                                                              block_source == x[2].get_node())) 
-        # We give it four tries at most
-        last_exception = None
-        noresponses = []
-        skipped = []
-        for _ in range(0, 4):
+        start = time.time()
+        stall_count = 0
+        while True:
+            stall_count += 1
+            # Create a sorted list of node suitability metrics and node clients
+            unsorted = []
+            for client in self._layer2_clients[layer2]:
+                unsorted.append(client.get_quality())
+            block_source = block_source_var.get()
+            behind_blocks = behind_blocks_var.get()
+            slist = sorted(unsorted, key=lambda x: self.calculate_client_sort_key(x[0],
+                                                                                  x[1],
+                                                                                  x[2].predicted_sleep(),
+                                                                                  x[2].get_projected_ratelimit_window_latency(),
+                                                                                  behind_blocks,
+                                                                                  api,
+                                                                                  method,
+                                                                                  block_source == x[2].get_node()))
+            noresponses = []
+            exceptions = []
+            node_count = 0
             # Go through the full list of node clients
             for entry in slist:
                 # Don't use nodes with an error rate of two thirds or more,
                 # don'r use nodes with a latency of more than 30 seconds.
                 if entry[0] < 0.667 and entry[1] < 30:
+                    node_count += 1
                     try:
                         # Every node client gets two quick tries.
                         return await entry[2].retried_request(api=api,
@@ -996,17 +1013,17 @@ class BaseBot:
                                                               max_retry=2,
                                                               retry_pause=0.2)
                     except JsonRpcError as exp:
-                        last_exception = exp
+                        exceptions.append(exp)
                     except NoResponseError as exp:
                         noresponses.append(exp)
-                skipped.append(entry)
-        if last_exception is not None:
-            raise last_exception
-        print("PARENT EXCEPTIONS:", noresponses)
-        print("SKIPPED QUALITY:", skipped)
-        raise NoResponseError("No valid response from any node", parents=noresponses)
+            await self.forwarder.stall_hook(node_count=node_count,
+                                            stall_count=stall_count,
+                                            stall_time=time.time()-start,
+                                            exceptions=exceptions,
+                                            noresponses=noresponses)
 
     def set_key(self, key, identity="default"):
+        """Set signing key for identity"""
         self._signers[identity] = Signer(bot=self, key=key)
 
     def update_signing_reference(self, blockno, blockid, timestamp):

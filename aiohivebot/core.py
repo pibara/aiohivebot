@@ -23,21 +23,23 @@ class JsonRpcError(Exception):
 
 class NoResponseError(Exception):
     """Exception for when none of the nodes gave a valid response"""
-    def __init__(self, message, exceptions=[], node=None, parents=[]):
+    def __init__(self, message, exceptions=None, node=None, parents=None):
         super().__init__(message)
         self.exceptions = {}
         if node is not None:
-            self.exceptions[node] = exceptions
-        for parent in parents:
-            for key, val in parent.items():
-                if key not in self.exceptions:
-                    self.exceptions[key] = []
-                for item in val:
-                    self.exceptions[key].append(item)
+            self.exceptions[node] = exceptions if exceptions is not None else []
+        if parents is not None:
+            for parent in parents:
+                for key, val in parent.items():
+                    if key not in self.exceptions:
+                        self.exceptions[key] = []
+                    for item in val:
+                        self.exceptions[key].append(item)
 
     def dump(self):
+        """Dump"""
         print(self.exceptions)
-        
+
 
 class _RateLimitingPolicy:
     def __init__(self, policy, starttime):
@@ -47,14 +49,15 @@ class _RateLimitingPolicy:
         self.reset = starttime + self.time_window
 
     def update(self, now):
+        """Update state for pollicy"""
         self.remaining -= 1
-        if self.remaining < 0:
-            self.remaining = 0
+        self.remaining = max(self.remaining, 0)
         if now >= self.reset:
             self.reset = now + self.time_window
             self.remaining = self.quota -1
 
     def rate(self, now):
+        """Get average rarfore aining window"""
         if self.reset <= now:
             return self.quota / self.time_window
         if self.remaining == 0:
@@ -62,6 +65,7 @@ class _RateLimitingPolicy:
         return self.remaining / (self.reset - now)
 
     def get(self, now):
+        """Get params of single policy state"""
         if self.reset <= now:
             return self.quota / self.time_window, self.quota, self.quota, now + self.time_window, self.time_window
         if self.remaining == 0:
@@ -78,11 +82,13 @@ class _RateLimitingPolicies:
             self.policies.append(_RateLimitingPolicy(policy, now))
 
     def update(self):
+        """Update all rate limit state for all policies of this node"""
         now = time.time()
         for policy in self.policies:
             policy.update(now)
 
     def get(self):
+        """Get the the values for the currently relevant rate limit policy"""
         now = time.time()
         best_policy = None
         best_limit = None
@@ -95,7 +101,7 @@ class _RateLimitingPolicies:
                 best_policy = policy
                 best_rate, best_limit, best_remaining, best_reset, best_time_window = policy.get(now)
             else:
-                rate, limit, remaining, reset, time_window = policy.get(now)
+                rate, _, remaining, reset, _ = policy.get(now)
                 # If one policy is exausted, we must return the best exausted policy no matter what
                 if best_rate is None:
                     if rate is None:
@@ -128,6 +134,7 @@ class _RateLimitClient:
         self.clear_status()
 
     def clear_status(self):
+        """Clear rate limit status"""
         self.status["count"] = 0
         self.status["uses_ratelimit_header"] = False
         self.status["used_429"] = False
@@ -135,6 +142,7 @@ class _RateLimitClient:
         self.status["total_ratelimit_sleeptime"] = 0.0
 
     def get_projected_ratelimit_window_latency(self):
+        """Get the mean latency under max load focurre t rate limmit window"""
         remaining_window = self.reset - time.time()
         if remaining_window <= 0:
             return self.time_window/self.limit
@@ -143,6 +151,7 @@ class _RateLimitClient:
         return remaining_window / self.remaining
 
     def update(self, headers, code):
+        """Update rate limmiting vars based on response and simulated policies"""
         self.simulator.update()
         self.status["count"] += 1
         self.limit, self.remaining, self.reset, self.time_window = self.simulator.get()
@@ -155,11 +164,11 @@ class _RateLimitClient:
                 subparts = part.split("=")
                 if len(subparts) == 2 and subparts[1].isnumeric() and subparts[0] in ("limit", "remaining", "reset"):
                     if subparts[0] == "limit":
-                        self.limit = int(subpart[1])
+                        self.limit = int(subparts[1])
                     if subparts[0] == "remaining":
-                        self.remaining = int(subpart[1])
+                        self.remaining = int(subparts[1])
                     if subparts[0] == "reset":
-                        self.reset = int(subpart[1])
+                        self.reset = int(subparts[1])
         elif code == 429:
             self.status["used_429"] = True
             self.remaining = 0
@@ -171,6 +180,7 @@ class _RateLimitClient:
             self.reset = time.time() + 900
 
     def predicted_sleep(self):
+        """Get the predicted duration for the next rate limmiting sleep"""
         if self.reset - time.time() <= 0:
             return None
         if self.remaining == 0:
@@ -183,6 +193,7 @@ class _RateLimitClient:
         return (self.reset - time.time())/(self.remaining -0.5)
 
     async def sleep(self):
+        """Sleep if needed for rate limiting"""
         sleeptime = self.predicted_sleep()
         if sleeptime is not None:
             self.status["total_ratelimit_sleeptime"] += sleeptime
@@ -201,16 +212,16 @@ class JsonRpcClient:
             layer2="",
             probe_time=3,
             reinit_time=900,  # 15 minutes
-            config={}):
+            config=None):
         headers = {
                 "user-agent": "aiohivebot-/" + VERSION,
                 "Content-Type": "application/json"
             }
         nodeurl = "https://" + public_api_node
         if public_api_path:
-            nodeurl += "/" + public_api_paself.nodeth
+            nodeurl += "/" + public_api_path
         self._api_node = public_api_node
-        self.config = config
+        self.config = config if config is not None else {}
         if "rate" not in config:
             config["rate"] = 60
         if "single_block" not in config:
@@ -244,27 +255,30 @@ class JsonRpcClient:
         self._rate_limit = _RateLimitClient(policies=self.config["policies"], node=public_api_node)
 
     def predicted_sleep(self):
+        """Get the predicted sleep that ratelimiting would imply for next get"""
         psleep = self._rate_limit.predicted_sleep()
         if psleep is None:
             return 0.0
         return psleep
 
     def get_projected_ratelimit_window_latency(self):
+        """Get the projected latency if the current rate limit window is to get exausted"""
         return self._rate_limit.get_projected_ratelimit_window_latency()
 
     def get_node(self):
+        """Get api node host name"""
         return self._api_node
 
+    # pylint: disable=too-many-statements,too-many-locals,too-many-branches
     async def retried_request(self,
                               method,
                               params,
                               api="",
                               retry_pause=0.5,
                               max_retry=-1):
-        exceptions = []
-        # pylint: disable=too-many-branches
         """Try to do a request repeatedly on a potentially flaky API node untill it
         succeeds or limits are exceeded"""
+        exceptions = []
         # Use unique id's for JSON-RPC requests, not realy usefull without JSON-RPC
         # batches, but may help with debugging someday.
         self._id += 1
@@ -406,7 +420,7 @@ class JsonRpcClient:
                 interval = time.time() - self._last_reinit
                 self._last_reinit = time.time()
                 error_rate = self._stats["errors"] / interval
-                ok_rate = ((self._stats["requests"] - self._stats["errors"]) / interval)
+                ok_rate = (self._stats["requests"] - self._stats["errors"]) / interval
                 block_rate = self._stats["blocks"] / interval
                 error_rate = self._stats["error_rate"].get()
                 if math.isnan(error_rate):
