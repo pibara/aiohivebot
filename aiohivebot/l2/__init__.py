@@ -26,7 +26,9 @@ async def process_l2_event(
         blockno,
         block,
         client_info,
-        timestamp):
+        timestamp,
+        head_block,
+        irreversable_block):
     """Process one layer 2 event"""
     # pylint: disable=too-many-arguments
     if custom_json_id == "l2_ssc_mainnet_hive":

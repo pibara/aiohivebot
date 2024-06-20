@@ -1,6 +1,7 @@
 """A multi-eventloop asynchonous python lib for writing HIVE-blockchain bots
 and DApp backend code"""
 import asyncio
+import contextvars
 import time
 import json
 import os
@@ -18,6 +19,8 @@ from aiohivebot.l2 import makel2client, l2names, process_l2_event, layer2_multin
 from aiohivebot.l2 import l2_process_block
 from aiohivebot.core import JsonRpcClient, JsonRpcError, NoResponseError
 
+block_source_var = contextvars.ContextVar('block_source')
+behind_blocks_var = contextvars.ContextVar('behind_blocks')
 
 class FunctionNull:
     """Do nothing functor"""
@@ -77,7 +80,7 @@ class ObjectForwarder:
                         bot=bot,
                         eat_exceptions=eat_exceptions,
                         layer2=subname
-                    )
+                        )
             for method in dir(bot):
                 if (method[0] != "_"
                         and not method.startswith("internal_")
@@ -141,9 +144,15 @@ class _PubNodeClient(JsonRpcClient):
                 probe_time=3,
                 reinit_time=900,
                 config=config
-            )
+                )
         self._api_list = []
         self._probes = probes
+
+    async def run(self):
+        """The main ever lasting loop for this public API node"""
+        block_source_var.set(self._api_node)
+        behind_blocks_var.set(0)
+        await super().run()
 
     def get_api_quality(self, api):
         """Get the current quality metrics for the HIVE-API node, that is the current error rate
@@ -179,9 +188,9 @@ class _PubNodeClient(JsonRpcClient):
         # Get the list or methods that are explicitly advertised
         try:
             methods = await self.retried_request(method="jsonrpc.get_methods",
-                                                 params={},
-                                                 retry_pause=30,
-                                                 max_retry=10)
+                    params={},
+                    retry_pause=30,
+                    max_retry=10)
         except (JsonRpcError, NoResponseError):
             methods = []
         if methods is None:
@@ -228,7 +237,7 @@ class _PubNodeClient(JsonRpcClient):
         self._stats["blocks"] += 1
         try:
             return await self.retried_request(method="block_api.get_block",
-                                              params={"block_num": blockno})
+                    params={"block_num": blockno})
         except (JsonRpcError, NoResponseError):
             return None
 
@@ -237,8 +246,8 @@ class _PubNodeClient(JsonRpcClient):
         self._stats["block_range"] += 1
         try:
             return await self.retried_request(method="block_api.get_block_range",
-                                              params={"starting_block_num": blockno,
-                                                  "count": count})
+                    params={"starting_block_num": blockno,
+                        "count": count})
         except (JsonRpcError, NoResponseError):
             return None
 
@@ -343,7 +352,7 @@ class Signer:
                 "operations": operations,
                 "extensions": [],
                 "signatures": []
-            }
+                }
         print(json.dumps(tx, indent=2))
         transhex = await self.bot.condenser_api.get_transaction_hex(tx)
         print("transhex:", transhex)
@@ -357,16 +366,16 @@ class BaseBot:
     stream event handlers"""
     # pylint: disable=too-many-arguments, too-many-instance-attributes
     def __init__(self,
-                 start_block=None,
-                 roll_back=0,
-                 roll_back_units="blocks",
-                 eat_exceptions=False,
-                 enable_layer2=None,
-                 use_irreversable=False,
-                 use_virtual=False,
-                 maintain_order=False,
-                 ratelimit_period=60,
-                 ratelimit_req_per_period=60):
+            start_block=None,
+            roll_back=0,
+            roll_back_units="blocks",
+            eat_exceptions=False,
+            enable_layer2=None,
+            use_irreversable=False,
+            use_virtual=False,
+            maintain_order=False,
+            ratelimit_period=60,
+            ratelimit_req_per_period=60):
         # pylint: disable=too-many-locals
         self.forwarder = ObjectForwarder(self, eat_exceptions)
         self._block = start_block
@@ -411,9 +420,9 @@ class BaseBot:
             l2nodepath = os.path.join(
                     os.path.dirname(
                         os.path.abspath(__file__)
-                    ),
+                        ),
                     "l2", key + "-nodes.json"
-                )
+                    )
             with open(l2nodepath, encoding="utf-8") as jsonfile:
                 l2_nodes = json.load(jsonfile)
                 l2_nodes = [[x, ""] if isinstance(x, str) else x for x in l2_nodes]
@@ -432,15 +441,15 @@ class BaseBot:
 
     # pylint: disable=too-many-arguments
     async def internal_node_status(self,
-                                   node_uri,
-                                   error_percentage,
-                                   latency,
-                                   ok_rate,
-                                   error_rate,
-                                   block_rate=0,
-                                   rate_limit_status={},
-                                   detailed_error_status={},
-                                   layer2=""):
+            node_uri,
+            error_percentage,
+            latency,
+            ok_rate,
+            error_rate,
+            block_rate=0,
+            rate_limit_status={},
+            detailed_error_status={},
+            layer2=""):
         """This callback forwards hourly node status to the bot implementation if
         callback is defined"""
         if layer2:
@@ -508,7 +517,7 @@ class BaseBot:
                                 and "block" in wholeblock):
                             self._block += 1
                             self.processing = True
-                            await self._process_block(blockno, wholeblock["block"].copy(), client_info)
+                            await self._process_block(blockno, wholeblock["block"].copy(), client_info, head_block=block, irr_block=irrblock)
                             self.processing = False
                             count +=1
             else: # There is a lot to catch up with, we get many blocks at once in order to catch up.
@@ -524,7 +533,7 @@ class BaseBot:
                         if blockno - self._block == 1:
                             self._block += 1
                             self.processing = True
-                            await self._process_block(blockno, manyblocks["blocks"][index].copy(), client_info)
+                            await self._process_block(blockno, manyblocks["blocks"][index].copy(), client_info, head_block=block, irr_block=irrblock)
                             self.processing = False
                             count += 1
         if self.abort_block:
@@ -554,9 +563,9 @@ class BaseBot:
                         self._l2block[layer2] += 1
                         # Process the actual block
                         await self._process_block_l2(layer2=layer2,
-                                                     blockno=blockno,
-                                                     block=wholeblock.copy(),
-                                                     client_info=client_info)
+                                blockno=blockno,
+                                block=wholeblock.copy(),
+                                client_info=client_info)
 
     def wire_up_get_runnables(self):
         """Get runnables with an async run ans synchonous abort method"""
@@ -620,24 +629,26 @@ class BaseBot:
             methodname = "notify_" + str(operation["value"]["json"][0])
             if hasattr(self, methodname):
                 await getattr(self.forwarder, methodname)(
-                    required_auths=operation["value"]["required_auths"],
-                    required_posting_auths=operation["value"][
-                        "required_posting_auths"],
-                    body=operation["value"]["json"][1],
-                    tid=tid,
-                    transaction=transaction,
-                    block=block,
-                    client_info=client_info,
-                    timestamp=timestamp)
+                        required_auths=operation["value"]["required_auths"],
+                        required_posting_auths=operation["value"][
+                            "required_posting_auths"],
+                        body=operation["value"]["json"][1],
+                        tid=tid,
+                        transaction=transaction,
+                        block=block,
+                        client_info=client_info,
+                        timestamp=timestamp)
 
     async def _process_custom_json(self,
-                                   operation,
-                                   tid,
-                                   transaction,
-                                   blockno,
-                                   block,
-                                   client_info,
-                                   timestamp):
+            operation,
+            tid,
+            transaction,
+            blockno,
+            block,
+            client_info,
+            timestamp,
+            head_block,
+            irreversable_block):
         if ("id" in operation["value"] and
                 "json" in operation["value"] and
                 "required_auths" in operation["value"] and
@@ -657,23 +668,28 @@ class BaseBot:
                         blockno=blockno,
                         block=block,
                         client_info=client_info,
-                        timestamp=timestamp)
+                        timestamp=timestamp,
+                        head_block=head_block,
+                        irreversable_block=irreversable_block)
             await process_l2_event(
-                        self.forwarder,
-                        custom_json_id=custom_json_id,
-                        required_auths=operation["value"]["required_auths"],
-                        required_posting_auths=operation["value"][
-                            "required_posting_auths"],
-                        body=operation["value"]["json"],
-                        tid=tid,
-                        transaction=transaction,
-                        blockno=blockno,
-                        block=block,
-                        client_info=client_info,
-                        timestamp=timestamp)
+                    self.forwarder,
+                    custom_json_id=custom_json_id,
+                    required_auths=operation["value"]["required_auths"],
+                    required_posting_auths=operation["value"][
+                        "required_posting_auths"],
+                    body=operation["value"]["json"],
+                    tid=tid,
+                    transaction=transaction,
+                    blockno=blockno,
+                    block=block,
+                    client_info=client_info,
+                    timestamp=timestamp,
+                    head_block=head_block,
+                    irreversable_block=irreversable_block)
 
-    async def _process_block(self, blockno, block, client_info):
+    async def _process_block(self, blockno, block, client_info, head_block, irr_block):
         """Process a brand new block"""
+        behind_blocks_var.set(head_block - blockno)
         # Separate transactions and transaction ids from the block
         transactions = block.pop("transactions")
         transaction_ids = block.pop("transaction_ids")
@@ -686,11 +702,13 @@ class BaseBot:
             timestamp = datetime.datetime.fromtimestamp(0)
         # If the derived class has a "block" callback, invoke it
         await self.forwarder.block(block=block,
-                                   blockno=blockno,
-                                   transactions=transactions,
-                                   transaction_ids=transaction_ids,
-                                   client_info=client_info,
-                                   timestamp=timestamp)
+                blockno=blockno,
+                transactions=transactions,
+                transaction_ids=transaction_ids,
+                client_info=client_info,
+                timestamp=timestamp,
+                head_block=head_block,
+                irreversable_block=irr_block)
         # Process all the transactions in the block
         # pylint: disable=consider-using-enumerate
         for index in range(0, len(transactions)):
@@ -698,23 +716,27 @@ class BaseBot:
             operations = transactions[index].pop("operations")
             # If the derived class has a "transaction" callback, invoke it
             await self.forwarder.transaction(tid=transaction_ids[index],
-                                             transaction=transactions[index],
-                                             blockno=blockno,
-                                             block=block,
-                                             client_info=client_info,
-                                             timestamp=timestamp)
+                    transaction=transactions[index],
+                    blockno=blockno,
+                    block=block,
+                    client_info=client_info,
+                    timestamp=timestamp,
+                    head_block=head_block,
+                    irreversable_block=irr_block)
             if self._abandon:
                 return
             # Process all the operations in the transaction
             for operation in operations:
                 # If the derived class has a "operation" callback, invoke it
                 await self.forwarder.operation(operation=operation,
-                                               tid=transaction_ids[index],
-                                               transaction=transactions[index],
-                                               blockno=blockno,
-                                               block=block,
-                                               client_info=client_info,
-                                               timestamp=timestamp)
+                        tid=transaction_ids[index],
+                        transaction=transactions[index],
+                        blockno=blockno,
+                        block=block,
+                        client_info=client_info,
+                        timestamp=timestamp,
+                        head_block=head_block,
+                        irreversable_block=irr_block)
                 if self._abandon:
                     return
                 # If the derived class has an operation type specificcallback, invoke it
@@ -728,7 +750,9 @@ class BaseBot:
                                 blockno=blockno,
                                 block=block,
                                 client_info=client_info,
-                                timestamp=timestamp)
+                                timestamp=timestamp,
+                                head_block=head_block,
+                                irreversable_block=irr_block)
                         if self._abandon:
                             return
                     if operation["type"] == "custom_json_operation":
@@ -739,23 +763,27 @@ class BaseBot:
                                 blockno=blockno,
                                 block=block,
                                 client_info=client_info,
-                                timestamp=timestamp)
+                                timestamp=timestamp,
+                                head_block=head_block,
+                                irreversable_block=irr_block)
         if self.use_virtual:
             virtual_ops = await self.account_history_api.get_ops_in_block(
                     block_num=blockno,
                     only_virtual=True,
                     include_reversible=self.use_irreversable)
             if self._abandon:
-                    return
+                return
             for vop in virtual_ops["ops"]:
                 operation = vop["op"]
                 await self.forwarder.operation(operation=operation,
-                                               tid=vop["trx_id"],
-                                               transaction="VIRTUAL",
-                                               blockno=vop["block"],
-                                               block=block,
-                                               client_info=client_info,
-                                               timestamp=timestamp)
+                        tid=vop["trx_id"],
+                        transaction="VIRTUAL",
+                        blockno=vop["block"],
+                        block=block,
+                        client_info=client_info,
+                        timestamp=timestamp,
+                        head_block=head_block,
+                        irreversable_block=irr_block)
                 if self._abandon:
                     return
                 if "type" in operation and "value" in operation:
@@ -768,20 +796,30 @@ class BaseBot:
                                 blockno=block,
                                 block=block,
                                 client_info=client_info,
-                                timestamp=timestamp)
+                                timestamp=timestamp,
+                                head_block=head_block,
+                                irreversable_block=irr_block)
                         if self._abandon:
                             return
         await self.forwarder.block_processed(
                 blockno=blockno,
                 client_info=client_info,
-                timestamp=timestamp)
-        await self._block_processed()
+                timestamp=timestamp,
+                head_block=head_block,
+                irreversable_block=irr_block)
+        await self._block_processed(head_block=head_block, irreversable_block=irr_block)
 
-    async def _block_processed(self):
+    async def _block_processed(self, head_block, irreversable_block):
         self.block_counter += 1
         age = time.time() -  self.start
         if age >= 60:
-            await self.forwarder.monitor_block_rate(rate=int(self.block_counter * 100 / age)/100)
+            behind_head = head_block - self._block
+            behind_irreversable = irreversable_block - self._block
+            if behind_head < 0:
+                behind_head=0
+            if behind_irreversable < 0:
+                behind_irreversable = 0
+            await self.forwarder.monitor_block_rate(rate=int(self.block_counter * 100 / age)/100, behind_head=behind_head, behind_irreversable=behind_irreversable)
             self.block_counter = 0
             self.start = time.time()
 
@@ -852,13 +890,28 @@ class BaseBot:
     async def internal_transaction(self, key_id,  operations):
         """Sign and broadcast a list of operations as a transaction""" 
         await self._signers[key_id].transaction(operations)
-        
+
 
     def get_layer2_api(self, api):
         """Get the layer-2 API as a helper object"""
         if api in self._layer2_clients and self._layer2_clients[api]:
             return layer2_multinode_client(api=api, bot=self)
         raise AttributeError(f"Basebot has no active layer-2 {api}")
+
+    def calculate_client_sort_key(self, error_rate, recent_latency, predicted_ratelimit_sleep,
+            projected_ratelimit_window_latency, blocks_behind, api, method, is_block_source):
+        # other nodes might not yet have lhe last block
+        if blocks_behind < 2 and api == "account_history_api" and is_block_source:
+            return -1.0
+        # pick the worst case latency between reatelimit projected and recent decaying average
+        latency = recent_latency if recent_latency > projected_ratelimit_window_latency else projected_ratelimit_window_latency
+        # add any expected ratekimit sleep to the worst case latency
+        latency += predicted_ratelimit_sleep
+        # if we have a high node error rate, scale and increase the sorting value
+        if error_rate > 0.2:
+            latency *= 1 + error_rate
+            latency += error_rate 
+        return latency
 
     async def internal_api_call(self, api, method, params):
         """This method sets out a JSON-RPC request with the curently most reliable
@@ -867,9 +920,20 @@ class BaseBot:
         unsorted = []
         for client in self._clients:
             unsorted.append(client.get_api_quality(api))
-        slist = sorted(unsorted, key=lambda x: (x[0], x[1]))
+        block_source = block_source_var.get()
+        behind_blocks = behind_blocks_var.get()
+        slist = sorted(unsorted, key=lambda x: self.calculate_client_sort_key(x[0],
+                                                                              x[1],
+                                                                              x[2].predicted_sleep(),
+                                                                              x[2].get_projected_ratelimit_window_latency(),
+                                                                              behind_blocks,
+                                                                              api,
+                                                                              method,
+                                                                              block_source == x[2].get_node()))
         # We give it four tries at most
         last_exception = None
+        exceptions = []
+        parents = []
         for _ in range(0, 4):
             # Go through the full list of node clients
             for entry in slist:
@@ -879,17 +943,23 @@ class BaseBot:
                     try:
                         # Every node client gets two quick tries.
                         return await entry[2].retried_request(api=api,
-                                                              method=method,
-                                                              params=params,
-                                                              max_retry=2,
-                                                              retry_pause=0.2)
+                                method=method,
+                                params=params,
+                                max_retry=2,
+                                retry_pause=0.2)
                     except JsonRpcError as exp:
+                        exceptions.append(exp)
                         last_exception = exp
-                    except NoResponseError:
+                    except NoResponseError as exp:
+                        parents.append(exp)
                         pass
+
         if last_exception is not None:
             raise last_exception
-        raise NoResponseError("No valid response from any node""")
+        exc = NoResponseError("No valid response from any node", exceptions=exceptions, node="any", parents=parents)
+        print(slist)
+        exc.dump()
+        raise exc
 
     async def internal_api_call_l2(self, layer2, api, method, params):
         """This method sets out a JSON-RPC request with the curently most reliable
@@ -898,9 +968,20 @@ class BaseBot:
         unsorted = []
         for client in self._layer2_clients[layer2]:
             unsorted.append(client.get_quality())
-        slist = sorted(unsorted, key=lambda x: (x[0], x[1]))
+        block_source = block_source_var.get()
+        behind_blocks = behind_blocks_var.get()
+        slist = sorted(unsorted, key=lambda x: self.calculate_client_sort_key(x[0],
+                                                                              x[1],
+                                                                              x[2].predicted_sleep(),
+                                                                              x[2].get_projected_ratelimit_window_latency(),
+                                                                              behind_blocks,
+                                                                              api,
+                                                                              method,
+                                                                              block_source == x[2].get_node())) 
         # We give it four tries at most
         last_exception = None
+        noresponses = []
+        skipped = []
         for _ in range(0, 4):
             # Go through the full list of node clients
             for entry in slist:
@@ -916,11 +997,14 @@ class BaseBot:
                                                               retry_pause=0.2)
                     except JsonRpcError as exp:
                         last_exception = exp
-                    except NoResponseError:
-                        pass
+                    except NoResponseError as exp:
+                        noresponses.append(exp)
+                skipped.append(entry)
         if last_exception is not None:
             raise last_exception
-        raise NoResponseError("No valid response from any node""")
+        print("PARENT EXCEPTIONS:", noresponses)
+        print("SKIPPED QUALITY:", skipped)
+        raise NoResponseError("No valid response from any node", parents=noresponses)
 
     def set_key(self, key, identity="default"):
         self._signers[identity] = Signer(bot=self, key=key)

@@ -8,7 +8,7 @@ import ssl
 import httpx
 from average import EWMA
 
-VERSION = "0.2.3"
+VERSION = "0.2.9"
 
 
 class JsonRpcError(Exception):
@@ -23,7 +23,21 @@ class JsonRpcError(Exception):
 
 class NoResponseError(Exception):
     """Exception for when none of the nodes gave a valid response"""
+    def __init__(self, message, exceptions=[], node=None, parents=[]):
+        super().__init__(message)
+        self.exceptions = {}
+        if node is not None:
+            self.exceptions[node] = exceptions
+        for parent in parents:
+            for key, val in parent.items():
+                if key not in self.exceptions:
+                    self.exceptions[key] = []
+                for item in val:
+                    self.exceptions[key].append(item)
 
+    def dump(self):
+        print(self.exceptions)
+        
 
 class _RateLimitingPolicy:
     def __init__(self, policy, starttime):
@@ -120,6 +134,14 @@ class _RateLimitClient:
         self.status["used_retry_header"] = False
         self.status["total_ratelimit_sleeptime"] = 0.0
 
+    def get_projected_ratelimit_window_latency(self):
+        remaining_window = self.reset - time.time()
+        if remaining_window <= 0:
+            return self.time_window/self.limit
+        if self.remaining == 0:
+            return remaining_window + self.time_window/self.limit
+        return remaining_window / self.remaining
+
     def update(self, headers, code):
         self.simulator.update()
         self.status["count"] += 1
@@ -139,11 +161,12 @@ class _RateLimitClient:
                     if subparts[0] == "reset":
                         self.reset = int(subpart[1])
         elif code == 429:
-            self.status["used_429"] = False
+            self.status["used_429"] = True
             self.remaining = 0
             if retry is not None and retry.isnumeric():
-                self_status["used_retry_header"] = True
+                self.status["used_retry_header"] = True
                 self.reset = time.time() + int(retry)
+                print("RETRY HEADER:", retry, self.node)
         if self.remaining == 0 and self.reset - time.time() > 900:
             self.reset = time.time() + 900
 
@@ -226,12 +249,19 @@ class JsonRpcClient:
             return 0.0
         return psleep
 
+    def get_projected_ratelimit_window_latency(self):
+        return self._rate_limit.get_projected_ratelimit_window_latency()
+
+    def get_node(self):
+        return self._api_node
+
     async def retried_request(self,
                               method,
                               params,
                               api="",
                               retry_pause=0.5,
                               max_retry=-1):
+        exceptions = []
         # pylint: disable=too-many-branches
         """Try to do a request repeatedly on a potentially flaky API node untill it
         succeeds or limits are exceeded"""
@@ -280,17 +310,24 @@ class JsonRpcClient:
                 self._stats["requests"] += 1
                 await self._rate_limit.sleep()
                 req = await client.post("/", content=jsonrpc_json)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exp:
+                exceptions.append(exp)
                 # HTTP errors are one way for the error_rate to increase, uses
                 # decaying average
                 self._stats["error_rate"].update(1)
                 self._stats["errors"] += 1
                 self._stats["detailed_error_stats"][full_method]["http-error"] += 1
-            except ssl.SSLError:
+            except ssl.SSLError as exp:
+                exceptions.append(exp)
                 self._stats["error_rate"].update(1)
                 self._stats["errors"] += 1
                 self._stats["detailed_error_stats"][full_method]["ssl-error"] += 1
             if req is not None:
+                if full_method not in self._stats["detailed_error_stats"]:
+                    self._stats["detailed_error_stats"][full_method] = {}
+                    self._stats["detailed_error_stats"][full_method]["http-error"] = 0
+                    self._stats["detailed_error_stats"][full_method]["ssl-error"] = 0
+                    self._stats["detailed_error_stats"][full_method]["code"] = {}
                 if req.status_code not in self._stats["detailed_error_stats"][full_method]["code"]:
                     self._stats["detailed_error_stats"][full_method]["code"][req.status_code] = 0
                 self._stats["detailed_error_stats"][full_method]["code"][req.status_code] += 1
@@ -301,6 +338,7 @@ class JsonRpcClient:
                     try:
                         rjson = req.json()
                     except json.decoder.JSONDecodeError as exc:
+                        exceptions.append(exc)
                         # JSON decode errors on what is expected to be a valid
                         # JSONRPC response is another way for the error_rate to
                         # increase, uses decaying average
@@ -309,6 +347,7 @@ class JsonRpcClient:
                 else:
                     # Non 200 OK responses are another way for the error_rate to
                     # increase, uses decaying average
+                    exceptions.append([req.status_code, req.text])
                     self._stats["error_rate"].update(1)
                     self._stats["errors"] += 1
                     #print("##############################")
@@ -334,7 +373,7 @@ class JsonRpcClient:
             if tries < max_retry and not self._abandon:
                 # Back off for a short while before trying again
                 await asyncio.sleep(retry_pause)
-        raise NoResponseError("No valid JSON-RPC response on query from any node.")
+        raise NoResponseError("No valid JSON-RPC response on query from any node.", exceptions=exceptions, node=self._api_node)
 
     def reliability_check(self, error_rate_treshold, max_latency):
         """Check if the node has its error rate and latency are within
