@@ -10,7 +10,7 @@ class MyBot(BaseBot):
     """Example of an aiohivebot python bot without real utility"""
     def __init__(self):
         jan2024=81520247
-        super().__init__(jan2024, use_virtual=True, maintain_order=True)
+        super().__init__(jan2024, use_virtual=True, maintain_order=False)
         self.count=0
         self.start_time = time.time()
         self.total_cought_up = datetime.timedelta(seconds=0)

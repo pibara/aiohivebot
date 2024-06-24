@@ -8,7 +8,7 @@ import ssl
 import httpx
 from average import EWMA
 
-VERSION = "0.2.9"
+VERSION = "0.3.0"
 
 
 class JsonRpcError(Exception):
@@ -19,6 +19,9 @@ class JsonRpcError(Exception):
 
     def __str__(self):
         return str(super()) + " : " + str(self.response)
+
+    def __repr__(self):
+        return super().__repr__() + " : " + str(self.response)
 
 
 class NoResponseError(Exception):
@@ -175,7 +178,6 @@ class _RateLimitClient:
             if retry is not None and retry.isnumeric():
                 self.status["used_retry_header"] = True
                 self.reset = time.time() + int(retry)
-                print("RETRY HEADER:", retry, self.node)
         if self.remaining == 0 and self.reset - time.time() > 900:
             self.reset = time.time() + 900
 
